@@ -1,0 +1,59 @@
+[package]
+name = "woodshed"
+description = "Build-script toolkit for vendoring, caching, and building native C/C++ dependencies from source"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["build-dependencies", "native", "vendor", "cmake", "ffi"]
+categories = ["development-tools::build-utils"]
+repository = "https://github.com/calebbuffa/woodshed"
+
+# Every block is optional. A consumer enables only what it uses and pays for
+# nothing else: each feature gates both a module and its dependencies.
+[features]
+default = ["manifest", "download", "tar-gz"]
+
+# Parse a pinned-dependency manifest (`versions.toml`).
+manifest = ["dep:toml", "dep:serde"]
+# Fetch archives over HTTPS.
+download = ["dep:ureq"]
+# Archive formats. Enable only the ones your dependencies actually ship.
+tar-gz = ["dep:tar", "dep:flate2"]
+tar-bz2 = ["dep:tar", "dep:bzip2"]
+tar-xz = ["dep:tar", "dep:liblzma"]
+zip = ["dep:zip"]
+# Drive CMake, with the MSVC runtime tied to the Rust target's CRT.
+cmake = ["process"]
+# Run child processes so Ctrl+C tears down the whole build tree.
+process = ["dep:ctrlc", "dep:libc"]
+# Discover an already-installed native library.
+vcpkg = ["dep:vcpkg"]
+pkg-config = ["dep:pkg-config"]
+
+[dependencies]
+# Always present: the cache is this crate's reason to exist, and it cannot
+# operate safely without checksums or interprocess locks.
+sha2 = "0.10"
+fs4 = "0.13"
+
+serde = { version = "1.0", features = ["derive"], optional = true }
+toml = { version = "0.9", optional = true }
+ureq = { version = "3.0", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1.0", optional = true }
+bzip2 = { version = "0.6", optional = true }
+liblzma = { version = "0.4", optional = true }
+zip = { version = "7.2", optional = true, default-features = false, features = [
+    "deflate",
+] }
+ctrlc = { version = "3.4", optional = true }
+vcpkg = { version = "0.2", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
