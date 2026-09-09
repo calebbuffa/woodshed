@@ -265,7 +265,7 @@ impl Cache {
     ///
     /// CMake permanently binds a build tree to the exact source path it was
     /// configured with. A build script whose CMake project lives inside the
-    /// crate — a superbuild, say — would therefore lose its entire build tree
+    /// crate - a superbuild, say - would therefore lose its entire build tree
     /// whenever the checkout moved, including during `cargo publish`'s
     /// verification build. Mirroring to a path that depends only on content
     /// makes the location stable, so CMake rebuilds only what actually
@@ -335,8 +335,8 @@ impl BuildDirs {
 
     /// Claim this build directory until the returned guard is dropped.
     ///
-    /// Two Cargo processes on one machine — commonly a build and a
-    /// rust-analyzer check — will otherwise compile into the same tree at the
+    /// Two Cargo processes on one machine - commonly a build and a
+    /// rust-analyzer check - will otherwise compile into the same tree at the
     /// same time and corrupt it. Take this before configuring, and hold it for
     /// the whole build.
     pub fn lock(&self) -> Result<BuildLock> {
