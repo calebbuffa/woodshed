@@ -32,7 +32,7 @@ ignores `CmakeBuild`; one that only wants to find an existing install takes
 
 woodshed leaves the choice to you but makes it hard to get wrong: `Linkage::{Static, Dynamic}`
 drives `CmakeBuild::linkage` (`BUILD_SHARED_LIBS`), `BuildKey::linkage` (separate cache
-dirs), `emit_link` (link directives, plus `libdir`/`bindir` metadata for dependents),
+dirs), `emit_link` (link directives, plus a loader path/rpath so the package's own tests can run, plus `libdir`/`bindir` metadata for dependents),
 `link_cpp_runtime_for` (only static libraries need the C++ runtime linked in) and
 `copy_shared_libs` (ship the DLLs/`.so` files next to your binary).
 

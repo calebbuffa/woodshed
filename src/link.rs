@@ -67,8 +67,34 @@ pub fn emit_link(prefix: &Path, libs: &[&str], linkage: Linkage) {
     }
     println!("cargo:includedir={}/include", prefix.display());
     if linkage.is_dynamic() {
+        emit_runtime_search(prefix);
         println!("cargo:libdir={}", prefix.join("lib").display());
         println!("cargo:bindir={}", prefix.join("bin").display());
+    }
+}
+
+/// Make a shared library loadable by the package's own tests, examples and
+/// benches.
+///
+/// Windows installs DLLs in `bin`, and Cargo puts every `native=` search path
+/// on `PATH` for `cargo test`/`run`, so `bin` is added. Unix targets get an
+/// rpath to `lib`/`lib64`, since macOS records `@rpath/...` install names and
+/// Linux uses versioned `.so` names. Build-script link args reach only this
+/// package's targets, so dependents must still ship the libraries (see
+/// [`copy_shared_libs`]).
+fn emit_runtime_search(prefix: &Path) {
+    if crate::target_is_unix() {
+        for dir in ["lib", "lib64"] {
+            let dir = prefix.join(dir);
+            if dir.is_dir() {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+            }
+        }
+    } else {
+        let bin = prefix.join("bin");
+        if bin.is_dir() {
+            println!("cargo:rustc-link-search=native={}", bin.display());
+        }
     }
 }
 
