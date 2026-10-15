@@ -136,6 +136,15 @@ impl CmakeBuild {
         self
     }
 
+    /// Build static or shared libraries: sets `BUILD_SHARED_LIBS`.
+    ///
+    /// Also remember to mix the same [`Linkage`](crate::Linkage) into the
+    /// [`BuildKey`](crate::BuildKey) with `BuildKey::linkage`.
+    #[must_use]
+    pub fn linkage(self, linkage: crate::Linkage) -> Self {
+        self.define("BUILD_SHARED_LIBS", linkage.build_shared_libs())
+    }
+
     /// Set a CMake cache variable.
     #[must_use]
     pub fn define(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {

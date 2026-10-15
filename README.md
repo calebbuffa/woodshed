@@ -8,9 +8,7 @@ time: where does the source come from, how do we know it is the right source,
 where does the build go, what happens when two builds run at once, and how does
 the result stay linkable. woodshed answers them once.
 
-The name is literal - a woodshed is where you keep the raw material before it is
-any use to anyone - and idiomatic: *woodshedding* is the unglamorous practice
-that makes a performance look effortless.
+A woodshed is where you keep the raw material before it is any use _woodshedding_ is the unglamorous practice that makes a performance look effortless.
 
 ## Blocks, not a framework
 
@@ -20,14 +18,36 @@ that drives its own build system takes `Toolchain` and `process::run` and
 ignores `CmakeBuild`; one that only wants to find an existing install takes
 `probe`. Nothing forces you up a layer.
 
-| Feature | Gives you |
-| --- | --- |
-| `manifest` | `Manifest` - pinned dependencies from `native/versions.toml` |
-| `download` | HTTPS fetching, with a system `curl` fallback for corporate proxies |
-| `tar-gz`, `tar-bz2`, `tar-xz`, `zip` | Archive extraction, one format each |
-| `cmake` | `CmakeBuild` - configure, build, install, with the MSVC runtime under control |
-| `process` | `process::run` - Ctrl+C tears down the whole build tree |
-| `vcpkg`, `pkg-config` | Probes for an already-installed library |
+| Feature                              | Gives you                                                                           |
+| ------------------------------------ | ----------------------------------------------------------------------------------- |
+| `manifest`                           | `Manifest` - pinned dependencies from `native/versions.toml`                        |
+| `download`                           | HTTPS fetching, with a system `curl` fallback for corporate proxies                 |
+| `tar-gz`, `tar-bz2`, `tar-xz`, `zip` | Archive extraction, one format each                                                 |
+| `cmake`                              | `CmakeBuild` - configure, build, install, with the MSVC runtime under control       |
+| `process`                            | `process::run` - Ctrl+C tears down the whole build tree                             |
+| `vcpkg`, `pkg-config`                | Probes for an already-installed library                                             |
+| `pin`, `cli`                         | `pin::{add, bump, verify}` and the `woodshed` command that maintain `versions.toml` |
+
+### Static vs. dynamic
+
+woodshed leaves the choice to you but makes it hard to get wrong: `Linkage::{Static, Dynamic}`
+drives `CmakeBuild::linkage` (`BUILD_SHARED_LIBS`), `BuildKey::linkage` (separate cache
+dirs), `emit_link` (link directives, plus `libdir`/`bindir` metadata for dependents),
+`link_cpp_runtime_for` (only static libraries need the C++ runtime linked in) and
+`copy_shared_libs` (ship the DLLs/`.so` files next to your binary).
+
+### Maintaining pins
+
+```text
+cargo install woodshed --features cli
+woodshed add geos --version 3.14.1 --url "https://download.osgeo.org/geos/{name}-{version}.tar.bz2"
+woodshed bump geos 3.15.0     # rewrites version, re-downloads, updates sha256
+woodshed verify               # re-hash every pin
+```
+
+`{version}` and `{name}` in `url` and `file` are substituted when a manifest loads, so a
+template URL makes a bump a one-field change. Only these commands download to compute a
+checksum; `build.rs` never does.
 
 `Cache`, `BuildKey`, `Toolchain`, `probe::Probe`, `verify_sha256`, and
 `link_cpp_runtime` are always available. Default features are `manifest`,
@@ -106,9 +126,9 @@ guessing.
 
 ## Environment
 
-| Variable | Effect |
-| --- | --- |
-| `WOODSHED_CACHE` | Cache location. Defaults to `$CARGO_HOME/woodshed`. |
+| Variable             | Effect                                                 |
+| -------------------- | ------------------------------------------------------ |
+| `WOODSHED_CACHE`     | Cache location. Defaults to `$CARGO_HOME/woodshed`.    |
 | `WOODSHED_OFFLINE=1` | Never download; fail with an actionable error instead. |
 
 ## License

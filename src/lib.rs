@@ -70,6 +70,7 @@ mod archive;
 mod cache;
 mod dep;
 mod error;
+mod link;
 pub mod probe;
 mod toolchain;
 
@@ -77,12 +78,15 @@ mod toolchain;
 mod cmake;
 #[cfg(feature = "download")]
 mod download;
+#[cfg(feature = "pin")]
+pub mod pin;
 #[cfg(feature = "process")]
 pub mod process;
 
 pub use cache::{BuildDirs, BuildKey, BuildLock, Cache};
 pub use dep::Dep;
 pub use error::{Error, Result};
+pub use link::{Linkage, copy_shared_libs, emit_link, link_cpp_runtime_for, shared_library_files};
 pub use toolchain::{Toolchain, find_on_path};
 
 #[cfg(feature = "cmake")]
@@ -158,11 +162,8 @@ pub fn link_cpp_runtime() {
     }
 }
 
-/// Verify a file's SHA-256 against `expected`, given as lowercase hex.
-///
-/// Streams the file, so an archive of any size costs a constant amount of
-/// memory.
-pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+/// The SHA-256 of a file, as lowercase hex. Streams the file.
+pub fn sha256_file(path: &Path) -> Result<String> {
     use sha2::Digest;
 
     let mut file = std::fs::File::open(path)
@@ -170,13 +171,19 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     let mut hasher = sha2::Sha256::new();
     std::io::copy(&mut file, &mut hasher)
         .map_err(|error| Error::io(format!("cannot read {}", path.display()), error))?;
-
-    let actual: String = hasher
+    Ok(hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
+        .collect())
+}
 
+/// Verify a file's SHA-256 against `expected`, given as lowercase hex.
+///
+/// Streams the file, so an archive of any size costs a constant amount of
+/// memory.
+pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {

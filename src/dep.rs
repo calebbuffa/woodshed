@@ -15,7 +15,9 @@ pub struct Dep {
     pub name: String,
     /// Exact upstream version.
     pub version: String,
-    /// Fixed download URL.
+    /// Fixed download URL. `{version}` and `{name}` are substituted when the
+    /// dependency is loaded from a [`Manifest`], so a version bump is a single
+    /// edit.
     pub url: String,
     /// Expected SHA-256 of the archive, as lowercase hex.
     pub sha256: String,
@@ -69,6 +71,15 @@ impl Dep {
     pub fn with_file(mut self, file: impl Into<String>) -> Self {
         self.file = Some(file.into());
         self
+    }
+
+    /// Replace `{version}` and `{name}` in `url` and `file`.
+    pub fn expand_templates(&mut self) {
+        let sub = |s: &str, v: &str, n: &str| s.replace("{version}", v).replace("{name}", n);
+        self.url = sub(&self.url, &self.version, &self.name);
+        if let Some(file) = &self.file {
+            self.file = Some(sub(file, &self.version, &self.name));
+        }
     }
 
     /// The filename this dependency's archive is cached under.
@@ -152,6 +163,7 @@ impl Manifest {
             .into_iter()
             .map(|(name, mut dep)| {
                 dep.name = name.clone();
+                dep.expand_templates();
                 (name, dep)
             })
             .collect();
@@ -200,6 +212,19 @@ mod tests {
     fn archive_file_falls_back_to_the_name() {
         let odd = Dep::new("thing", "1.0", "https://example.org/dl/", "ab");
         assert_eq!(odd.archive_file(), "thing");
+    }
+
+    #[cfg(feature = "manifest")]
+    #[test]
+    fn manifest_expands_url_templates() {
+        let manifest = Manifest::parse(
+            "[geos]\nversion = \"3.15.0\"\nurl = \"https://x.org/{name}/{name}-{version}.tar.bz2\"\n\
+             sha256 = \"ab\"\nfile = \"{name}-{version}.tar.bz2\"\n",
+        )
+        .unwrap();
+        let geos = manifest.get("geos").unwrap();
+        assert_eq!(geos.url, "https://x.org/geos/geos-3.15.0.tar.bz2");
+        assert_eq!(geos.archive_file(), "geos-3.15.0.tar.bz2");
     }
 
     #[test]

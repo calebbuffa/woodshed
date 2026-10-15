@@ -391,6 +391,13 @@ impl BuildKey {
         self.mix(dep.version.as_bytes()).mix(dep.sha256.as_bytes())
     }
 
+    /// Fold the linkage into the key, so a static and a shared build of the
+    /// same library never share a cache directory.
+    #[must_use]
+    pub fn linkage(self, linkage: crate::Linkage) -> Self {
+        self.mix(format!("linkage={}", linkage.as_str()))
+    }
+
     /// Mix in arbitrary bytes.
     #[must_use]
     pub fn mix(mut self, bytes: impl AsRef<[u8]>) -> Self {
