@@ -391,11 +391,13 @@ impl BuildKey {
         self.mix(dep.version.as_bytes()).mix(dep.sha256.as_bytes())
     }
 
-    /// Fold the linkage into the key, so a static and a shared build of the
-    /// same library never share a cache directory.
+    /// Fold the linkage, and the install rpath it implies, into the key, so a
+    /// static and a shared build of the same library never share a cache
+    /// directory, and a prefix built before an rpath change is not reused.
     #[must_use]
     pub fn linkage(self, linkage: crate::Linkage) -> Self {
-        self.mix(format!("linkage={}", linkage.as_str()))
+        let rpath = linkage.install_rpath(&crate::target_os()).unwrap_or("");
+        self.mix(format!("linkage={};rpath={rpath}", linkage.as_str()))
     }
 
     /// Mix in arbitrary bytes.

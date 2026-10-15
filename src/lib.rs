@@ -86,7 +86,10 @@ pub mod process;
 pub use cache::{BuildDirs, BuildKey, BuildLock, Cache};
 pub use dep::Dep;
 pub use error::{Error, Result};
-pub use link::{Linkage, copy_shared_libs, emit_link, link_cpp_runtime_for, shared_library_files};
+pub use link::{
+    Linkage, copy_shared_libs, emit_exe_rpath, emit_link, link_cpp_runtime_for,
+    shared_library_files,
+};
 pub use toolchain::{Toolchain, find_on_path};
 
 #[cfg(feature = "cmake")]

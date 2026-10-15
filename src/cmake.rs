@@ -138,11 +138,22 @@ impl CmakeBuild {
 
     /// Build static or shared libraries: sets `BUILD_SHARED_LIBS`.
     ///
+    /// Shared builds also get an install rpath relative to the library
+    /// (`$ORIGIN` on Linux, `@loader_path` on macOS). Without it a shared
+    /// library cannot find its sibling libraries (for example `libgeos_c.so`
+    /// needing `libgeos.so`), because the executable's rpath does not apply to
+    /// transitive dependencies on Linux, and a copied library directory would
+    /// not load.
+    ///
     /// Also remember to mix the same [`Linkage`](crate::Linkage) into the
     /// [`BuildKey`](crate::BuildKey) with `BuildKey::linkage`.
     #[must_use]
     pub fn linkage(self, linkage: crate::Linkage) -> Self {
-        self.define("BUILD_SHARED_LIBS", linkage.build_shared_libs())
+        let build = self.define("BUILD_SHARED_LIBS", linkage.build_shared_libs());
+        match linkage.install_rpath(&crate::target_os()) {
+            Some(rpath) => build.define("CMAKE_INSTALL_RPATH", rpath),
+            None => build,
+        }
     }
 
     /// Set a CMake cache variable.

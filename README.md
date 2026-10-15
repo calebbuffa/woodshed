@@ -32,9 +32,21 @@ ignores `CmakeBuild`; one that only wants to find an existing install takes
 
 woodshed leaves the choice to you but makes it hard to get wrong: `Linkage::{Static, Dynamic}`
 drives `CmakeBuild::linkage` (`BUILD_SHARED_LIBS`), `BuildKey::linkage` (separate cache
-dirs), `emit_link` (link directives, plus a loader path/rpath so the package's own tests can run, plus `libdir`/`bindir` metadata for dependents),
-`link_cpp_runtime_for` (only static libraries need the C++ runtime linked in) and
-`copy_shared_libs` (ship the DLLs/`.so` files next to your binary).
+dirs), `emit_link` (link directives; for a dynamic build it also stages the shared libraries in
+the build script's `OUT_DIR` and adds it as a `native=` path, which is the one place Cargo puts
+on the loader path for `cargo run`/`cargo test`, and exports `libdir`/`bindir` metadata
+for dependents),
+`link_cpp_runtime_for` (only static libraries need the C++ runtime linked in),
+`copy_shared_libs` (ship the DLLs/`.so` files next to your binary) and
+`emit_exe_rpath` (let the shipped executable find them).
+
+#### Shipping a dynamic build
+
+In the application's `build.rs` call `woodshed::emit_exe_rpath()`: Linux and macOS
+executables then load libraries from their own directory (Windows always does). Package the
+executable together with the files in the library's `DEP_<LINKS>_LIBDIR` / `_BINDIR`, or
+copy them with `copy_shared_libs`. Link arguments from a dependency's build script never
+reach the application's executable, so a library crate cannot do this for you.
 
 ### Maintaining pins
 

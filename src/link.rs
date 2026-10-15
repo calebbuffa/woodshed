@@ -40,6 +40,20 @@ impl Linkage {
     pub fn build_shared_libs(self) -> &'static str {
         if self.is_dynamic() { "ON" } else { "OFF" }
     }
+    /// The CMake `CMAKE_INSTALL_RPATH` a shared build needs so its libraries
+    /// find each other from their own directory, or `None` where the platform
+    /// needs none. Used for both the CMake arguments and the cache key, so the
+    /// two cannot disagree.
+    pub(crate) fn install_rpath(self, target_os: &str) -> Option<&'static str> {
+        if !self.is_dynamic() {
+            return None;
+        }
+        match target_os {
+            "linux" => Some("$ORIGIN"),
+            "macos" => Some("@loader_path"),
+            _ => None,
+        }
+    }
 }
 
 /// Emit link directives for a built prefix.
@@ -50,6 +64,19 @@ impl Linkage {
 /// `includedir` always, and for [`Linkage::Dynamic`] the `libdir` and `bindir`
 /// that hold the shared libraries (read as `DEP_<LINKS>_LIBDIR` / `_BINDIR`),
 /// so a packaging step can ship them with [`copy_shared_libs`].
+///
+/// For [`Linkage::Dynamic`] the shared libraries are also staged in this build
+/// script's `OUT_DIR` and that directory is added as a `native=` search path.
+/// Cargo puts `native=` directories **inside the target directory** on the
+/// loader path (`PATH`, `LD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`) of
+/// the programs it runs, and ignores any outside it (rust-lang/cargo#3366). The
+/// build cache lives outside it, so without staging, `cargo run` and `cargo
+/// test` could not load the library.
+///
+/// # Panics
+///
+/// If the shared libraries cannot be staged: continuing would produce a build
+/// whose programs fail at start-up.
 pub fn emit_link(prefix: &Path, libs: &[&str], linkage: Linkage) {
     for dir in ["lib", "lib64"] {
         let dir = prefix.join(dir);
@@ -67,37 +94,40 @@ pub fn emit_link(prefix: &Path, libs: &[&str], linkage: Linkage) {
     }
     println!("cargo:includedir={}/include", prefix.display());
     if linkage.is_dynamic() {
-        emit_runtime_search(prefix);
+        let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
+        let staged = stage_shared_libs(prefix, &Path::new(&out_dir).join("woodshed-shared"))
+            .unwrap_or_else(|error| panic!("woodshed: cannot stage shared libraries: {error}"));
+        println!("cargo:rustc-link-search=native={}", staged.display());
         println!("cargo:libdir={}", prefix.join("lib").display());
         println!("cargo:bindir={}", prefix.join("bin").display());
     }
 }
 
-/// Make a shared library loadable by the package's own tests, examples and
-/// benches.
-///
-/// Windows installs DLLs in `bin`, and Cargo puts every `native=` search path
-/// on `PATH` for `cargo test`/`run`, so `bin` is added. Unix targets get an
-/// rpath to `lib`/`lib64`, since macOS records `@rpath/...` install names and
-/// Linux uses versioned `.so` names. Build-script link args reach only this
-/// package's targets, so dependents must still ship the libraries (see
-/// [`copy_shared_libs`]).
-fn emit_runtime_search(prefix: &Path) {
-    if crate::target_is_unix() {
-        for dir in ["lib", "lib64"] {
-            let dir = prefix.join(dir);
-            if dir.is_dir() {
-                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
-            }
-        }
-    } else {
-        let bin = prefix.join("bin");
-        if bin.is_dir() {
-            println!("cargo:rustc-link-search=native={}", bin.display());
-        }
+/// Replace `dest` with a copy of the shared libraries installed under `prefix`.
+/// Starting empty means a library from an earlier version never lingers.
+fn stage_shared_libs(prefix: &Path, dest: &Path) -> Result<PathBuf> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)
+            .map_err(|e| Error::io(format!("cannot clear {}", dest.display()), e))?;
     }
+    copy_shared_libs(prefix, dest)?;
+    Ok(dest.to_path_buf())
 }
 
+/// Make the final executable find shared libraries sitting next to it.
+///
+/// Call this from the build script of the *application* that ships a dynamic
+/// build. Link arguments from a dependency's build script never reach the
+/// application's executable, so a library cannot do this for its users.
+/// Linux gets `$ORIGIN` and macOS `@executable_path`. Windows needs nothing:
+/// the loader always searches the executable's directory.
+pub fn emit_exe_rpath() {
+    match crate::target_os().as_str() {
+        "linux" => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN"),
+        "macos" => println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path"),
+        _ => {}
+    }
+}
 /// Emit the C++ runtime link directive appropriate to `linkage`.
 ///
 /// A static library's objects reference the C++ standard library, so it must
@@ -199,6 +229,22 @@ mod tests {
         assert_eq!(copied.len(), 3);
         assert!(dest.join("geos_c.dll").is_file());
         assert!(!dest.join("libgeos.a").exists());
+
+        std::fs::write(dest.join("stale.dll"), b"x").unwrap();
+        let staged = stage_shared_libs(&prefix, &dest).unwrap();
+        assert!(staged.join("libgeos.dylib").is_file());
+        assert!(!staged.join("stale.dll").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_rpath_follows_platform_and_linkage() {
+        assert_eq!(Linkage::Dynamic.install_rpath("linux"), Some("$ORIGIN"));
+        assert_eq!(
+            Linkage::Dynamic.install_rpath("macos"),
+            Some("@loader_path")
+        );
+        assert_eq!(Linkage::Dynamic.install_rpath("windows"), None);
+        assert_eq!(Linkage::Static.install_rpath("linux"), None);
     }
 }
