@@ -8,7 +8,7 @@ time: where does the source come from, how do we know it is the right source,
 where does the build go, what happens when two builds run at once, and how does
 the result stay linkable. woodshed answers them once.
 
-A woodshed is where you keep the raw material before it is any use _woodshedding_ is the unglamorous practice that makes a performance look effortless.
+A woodshed is where you keep the raw material before it is any use and _woodshedding_ is the unglamorous practice that makes a performance look effortless.
 
 ## Blocks, not a framework
 
@@ -27,6 +27,7 @@ ignores `CmakeBuild`; one that only wants to find an existing install takes
 | `process`                            | `process::run` - Ctrl+C tears down the whole build tree                             |
 | `vcpkg`, `pkg-config`                | Probes for an already-installed library                                             |
 | `pin`, `cli`                         | `pin::{add, bump, verify}` and the `woodshed` command that maintain `versions.toml` |
+| `bundle`                            | Build and assemble an application with transitive native deployment resources |
 
 ### Static vs. dynamic
 
@@ -47,6 +48,23 @@ executables then load libraries from their own directory (Windows always does). 
 executable together with the files in the library's `DEP_<LINKS>_LIBDIR` / `_BINDIR`, or
 copy them with `copy_shared_libs`. Link arguments from a dependency's build script never
 reach the application's executable, so a library crate cannot do this for you.
+
+### Inspect CMake configuration before compiling
+
+`CmakeBuild::configure()` returns a `ConfiguredCmakeBuild` after a successful
+configure step, without building native targets. Inspect generated headers,
+`CMakeCache.txt`, or requested CMake File API replies through
+`build_directory()`, then call `build()` to continue. `install()` remains the
+configure-and-build convenience method. Keep the `BuildDirs::lock()` guard
+alive across both phases; configuration alone is not artifact completeness.
+
+This separation supports maintainer binding generation and metadata discovery
+without first compiling a complete native compiler/toolchain. It does not
+guess dependency versions or fetch unpinned upstream dependencies.
+
+`Toolchain::detect()` respects an explicit `CMAKE_GENERATOR`. Reuse checks
+canonicalize source directories and recognize Windows verbatim/UNC spellings
+without discarding Unix path case sensitivity.
 
 ### Maintaining pins
 
@@ -135,6 +153,50 @@ on is your decision:
 
 Only you know which is true of your library, so woodshed asks rather than
 guessing.
+
+## Application bundles
+
+Enable `bundle` to use `woodshed::bundle_cargo`, or `cli` for:
+
+```text
+woodshed bundle --output dist -- --manifest-path app/Cargo.toml --bin app --release
+```
+
+The destination must be new. This builds one executable with `cargo rustc`,
+adds an executable-relative rpath on Linux/macOS, and copies native deployment
+trees declared by build scripts:
+
+```rust,ignore
+println!("cargo:rustc-env=WOODSHED_DEPLOYMENT_DIR={}", runtime_directory.display());
+```
+
+The bundler discovers these declarations through Cargo's JSON build messages,
+including transitive dependencies. Native integrations must populate the
+directory with all required redistributable libraries, helpers, and resources
+in their executable-relative layout. Build-only archives/import libraries do
+not belong there. The tool does not infer missing native dependencies or
+redistribution permissions.
+
+Select exactly one executable with `--bin` or `--example`. Target selection
+respects `--target`, `CARGO_BUILD_TARGET`, and Cargo's configuration hierarchy
+from the invocation directory (not the `--manifest-path` directory), in that
+order. Multi-target builds and CLI `--config` overrides fail explicitly; use
+configuration files or Cargo environment variables instead.
+
+Identical resource files from multiple dependencies are shared; conflicting
+contents, file/directory collisions, and missing directories fail explicitly.
+Files are staged in a temporary sibling directory and renamed into place only
+on success. Ordinary failures clean up staging without leaving a partial
+destination. An interrupted process may leave a `.woodshed-bundle-*` staging
+directory, never a ready-looking output directory. Run cross-built bundles on
+their destination platform.
+
+## 0.2.3 changes
+
+- Prepared source trees with dependency mounts and Windows symlink fallback.
+- Separate CMake configure/build phases and more reliable stale-tree detection.
+- Application bundling with transitive resources, Cargo target resolution,
+  identical-file sharing, and transactional output.
 
 ## Environment
 

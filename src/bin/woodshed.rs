@@ -10,6 +10,7 @@ USAGE:
   woodshed add <name> --version <v> --url <url> [--marker <path>]... [--file <name>] [--manifest <path>]
   woodshed bump <name> <new-version> [--url <url>] [--manifest <path>]
   woodshed verify [--manifest <path>]
+  woodshed bundle --output <new-directory> -- <cargo options: --manifest-path, --bin, --release, ...>
 
 `{version}` and `{name}` in a URL are substituted, so a template URL only needs
 the version changed on a bump. Default manifest: native/versions.toml
@@ -64,6 +65,19 @@ impl Args {
 }
 
 fn run(raw: Vec<String>) -> Result<(), String> {
+    if raw.first().is_some_and(|command| command == "bundle") {
+        if raw.len() < 4 || raw[1] != "--output" || raw[3] != "--" {
+            return Err(
+                "usage: woodshed bundle --output <new-directory> -- <cargo target/build options>"
+                    .into(),
+            );
+        }
+        let arguments = raw[4..].iter().map(Into::into).collect::<Vec<_>>();
+        let executable = woodshed::bundle_cargo(std::path::Path::new(&raw[2]), &arguments)
+            .map_err(|error| error.to_string())?;
+        println!("Bundled {}", executable.display());
+        return Ok(());
+    }
     let Some((command, rest)) = raw.split_first() else {
         print!("{USAGE}");
         return Ok(());

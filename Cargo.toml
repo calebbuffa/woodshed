@@ -1,7 +1,7 @@
 [package]
 name = "woodshed"
 description = "Build-script toolkit for vendoring, caching, and building native C/C++ dependencies from source"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -32,7 +32,9 @@ pkg-config = ["dep:pkg-config"]
 # Maintain `native/versions.toml`: add/bump/verify pins, computing checksums.
 pin = ["manifest", "download", "dep:toml_edit"]
 # The `woodshed` command-line tool (`cargo install woodshed --features cli`).
-cli = ["pin"]
+cli = ["pin", "bundle"]
+# Assemble a Cargo application with declared native runtime resources.
+bundle = ["dep:serde_json", "dep:cargo-config2", "dep:tempfile"]
 
 [[bin]]
 name = "woodshed"
@@ -43,6 +45,9 @@ required-features = ["cli"]
 # Always present: the cache is this crate's reason to exist, and it cannot
 # operate safely without checksums or interprocess locks.
 sha2 = "0.10"
+serde_json = { version = "1", optional = true }
+cargo-config2 = { version = "0.1", optional = true }
+tempfile = { version = "3", optional = true }
 fs4 = "0.13"
 
 serde = { version = "1.0", features = ["derive"], optional = true }
@@ -62,6 +67,9 @@ pkg-config = { version = "0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+junction = "1.2"
 
 [package.metadata.docs.rs]
 all-features = true

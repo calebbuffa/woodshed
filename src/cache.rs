@@ -125,6 +125,131 @@ impl Cache {
         }
     }
 
+    /// Assemble a writable source tree with dependencies at relative paths.
+    ///
+    /// The root is copied, while dependencies are mounted as Unix symlinks or
+    /// Windows directory junctions (which require no administrator privileges).
+    /// Assembly does not modify the inputs. Mounted dependencies remain shared:
+    /// builds must not write into them. On Windows, file symlinks are copied as
+    /// files if the host does not grant symlink creation privileges.
+    /// Use this for upstream projects that expect populated submodule directories.
+    ///
+    /// Trees live under `prepared/<key>` and have their own interprocess lock.
+    /// Interrupted assembly is retried; a completion marker is written last.
+    /// Include every source identity and mount path in `key`. Reusing a completed
+    /// key with different inputs is an error rather than a silent cache collision.
+    /// Existing nonempty directories are never removed to make room for a mount.
+    pub fn prepare(
+        &self,
+        key: &BuildKey,
+        source: &Path,
+        mounts: &[(PathBuf, PathBuf)],
+    ) -> Result<PathBuf> {
+        use sha2::{Digest, Sha256};
+        use std::path::Component;
+        let source = source
+            .canonicalize()
+            .map_err(|error| Error::io(format!("cannot resolve {}", source.display()), error))?;
+        let mut identity = Sha256::new();
+        identity.update(source.as_os_str().as_encoded_bytes());
+        let mut resolved = Vec::new();
+        for (path, dependency) in mounts {
+            if path.as_os_str().is_empty()
+                || !path
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                || mounts
+                    .iter()
+                    .any(|(other, _)| other != path && path.starts_with(other))
+                || mounts.iter().filter(|(other, _)| other == path).count() != 1
+            {
+                return Err(Error::io(
+                    "invalid or overlapping source mount",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        path.display().to_string(),
+                    ),
+                ));
+            }
+            let dependency = dependency.canonicalize().map_err(|error| {
+                Error::io(format!("cannot resolve {}", dependency.display()), error)
+            })?;
+            if !dependency.is_dir() {
+                return Err(Error::io(
+                    "source mount is not a directory",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        dependency.display().to_string(),
+                    ),
+                ));
+            }
+            identity.update([0]);
+            identity.update(path.as_os_str().as_encoded_bytes());
+            identity.update([0]);
+            identity.update(dependency.as_os_str().as_encoded_bytes());
+            resolved.push((path.clone(), dependency));
+        }
+        let identity = format!("{:x}", identity.finalize());
+        let directory = self.root.join("prepared").join(key.as_str());
+        fs::create_dir_all(directory.parent().expect("prepared directory has a parent"))
+            .map_err(|error| Error::io("cannot create prepared source directory", error))?;
+        let _lock = Lock::acquire(&lock_path(&directory, "prepare"))?;
+        let marker = directory.join(".woodshed-source-tree");
+        if marker.exists() {
+            if fs::read_to_string(&marker)
+                .map_err(|error| Error::io("cannot read source-tree marker", error))?
+                != identity
+            {
+                return Err(Error::io(
+                    "source-tree key reused for different inputs",
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        directory.display().to_string(),
+                    ),
+                ));
+            }
+        } else {
+            copy_source_root(&source, &directory, Path::new(""), &resolved)?;
+        }
+        for (relative, dependency) in &resolved {
+            let destination = directory.join(relative);
+            if fs::symlink_metadata(&destination).is_ok() {
+                if destination
+                    .canonicalize()
+                    .is_ok_and(|path| path == *dependency)
+                {
+                    continue;
+                }
+                // An upstream submodule placeholder may be empty, but arbitrary
+                // existing trees must not be deleted or silently substituted.
+                fs::remove_dir(&destination).map_err(|error| {
+                    Error::io(
+                        format!("cannot replace nonempty mount {}", destination.display()),
+                        error,
+                    )
+                })?;
+            }
+            fs::create_dir_all(destination.parent().expect("relative mount has a parent"))
+                .map_err(|error| Error::io("cannot create source mount parent", error))?;
+            #[cfg(windows)]
+            junction::create(dependency, &destination).map_err(|error| {
+                Error::io(format!("cannot mount {}", destination.display()), error)
+            })?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(dependency, &destination).map_err(|error| {
+                Error::io(format!("cannot mount {}", destination.display()), error)
+            })?;
+            #[cfg(not(any(windows, unix)))]
+            return Err(Error::io(
+                "source mounts require a Unix or Windows host",
+                std::io::Error::from(std::io::ErrorKind::Unsupported),
+            ));
+        }
+        fs::write(&marker, identity)
+            .map_err(|error| Error::io("cannot complete prepared source tree", error))?;
+        Ok(directory)
+    }
+
     /// Ensure a dependency's archive is present and checksum-verified.
     ///
     /// A cached archive is verified before reuse, so a truncated or tampered
@@ -279,6 +404,113 @@ impl Cache {
         copy_dir(source, &dest)?;
         Ok(dest)
     }
+}
+
+fn copy_source_root(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+) -> Result<()> {
+    fs::create_dir_all(destination)
+        .map_err(|error| Error::io("cannot create source-tree directory", error))?;
+    for entry in
+        fs::read_dir(source).map_err(|error| Error::io("cannot read source tree", error))?
+    {
+        let entry = entry.map_err(|error| Error::io("cannot read source-tree entry", error))?;
+        let relative = relative.join(entry.file_name());
+        if mounts.iter().any(|(mount, _)| relative.starts_with(mount)) {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| Error::io("cannot inspect source-tree entry", error))?;
+        if kind.is_symlink() {
+            let link = fs::read_link(entry.path())
+                .map_err(|error| Error::io("cannot read source symlink", error))?;
+            #[cfg(windows)]
+            if target.exists()
+                && (entry.path().canonicalize().is_ok_and(|resolved| {
+                    target
+                        .canonicalize()
+                        .is_ok_and(|existing| existing == resolved)
+                }) || (target.is_file()
+                    && entry.path().is_file()
+                    && crate::sha256_file(&target)? == crate::sha256_file(&entry.path())?))
+            {
+                continue;
+            }
+            if let Ok(existing) = fs::read_link(&target) {
+                if existing == link {
+                    continue;
+                }
+                return Err(Error::io(
+                    "source-tree symlink conflicts with existing destination",
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        target.display().to_string(),
+                    ),
+                ));
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link, &target).map_err(|error| {
+                Error::io(
+                    format!("cannot preserve symlink {}", target.display()),
+                    error,
+                )
+            })?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTypeExt;
+                let result = if kind.is_symlink_dir() {
+                    std::os::windows::fs::symlink_dir(&link, &target)
+                } else {
+                    std::os::windows::fs::symlink_file(&link, &target)
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(1314) => {
+                        let resolved = entry
+                            .path()
+                            .canonicalize()
+                            .map_err(|error| Error::io("cannot resolve source symlink", error))?;
+                        if kind.is_symlink_dir() {
+                            junction::create(&resolved, &target).map_err(|error| {
+                                Error::io("cannot mount source directory link", error)
+                            })?;
+                        } else {
+                            fs::copy(&resolved, &target).map_err(|error| {
+                                Error::io("cannot materialize source file link", error)
+                            })?;
+                        }
+                    }
+                    Err(error) => {
+                        return Err(Error::io(
+                            format!("cannot preserve symlink {}", target.display()),
+                            error,
+                        ));
+                    }
+                }
+            }
+        } else if kind.is_dir() {
+            copy_source_root(&entry.path(), &target, &relative, mounts)?;
+        } else if !target.is_file()
+            || crate::sha256_file(&entry.path())? != crate::sha256_file(&target)?
+        {
+            fs::copy(entry.path(), &target).map_err(|error| {
+                Error::io(
+                    format!(
+                        "cannot copy {} to {}",
+                        entry.path().display(),
+                        target.display()
+                    ),
+                    error,
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy every entry under `source` into `dest`.
@@ -639,5 +871,137 @@ mod tests {
         assert_eq!(fs::read(dst.join("nested/deep/leaf.txt")).unwrap(), b"leaf");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn prepared_sources_are_writable_without_mutating_cached_inputs() {
+        let root = temp_dir("prepared");
+        let source = root.join("upstream");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(source.join("third_party")).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(source.join("CMakeLists.txt"), b"upstream").unwrap();
+        fs::write(dependency.join("library.h"), b"dependency").unwrap();
+        let mounts = [(PathBuf::from("third_party/library"), dependency.clone())];
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("prepared");
+        let prepared = cache.prepare(&key, &source, &mounts).unwrap();
+        assert_eq!(
+            fs::read(prepared.join("third_party/library/library.h")).unwrap(),
+            b"dependency"
+        );
+        fs::write(prepared.join("CMakeLists.txt"), b"patched").unwrap();
+        assert_eq!(
+            fs::read(source.join("CMakeLists.txt")).unwrap(),
+            b"upstream"
+        );
+        assert_eq!(cache.prepare(&key, &source, &mounts).unwrap(), prepared);
+        assert_eq!(
+            fs::read(prepared.join("CMakeLists.txt")).unwrap(),
+            b"patched"
+        );
+        let other = root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        assert!(
+            cache
+                .prepare(
+                    &key,
+                    &source,
+                    &[(PathBuf::from("third_party/library"), other)]
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn prepared_sources_copy_relative_symlinks_and_retry() {
+        let root = temp_dir("prepared-symlink");
+        let source = root.join("upstream");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("original.txt"), b"linked source").unwrap();
+        let link = source.join("nested/link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../original.txt", &link).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file("..\\original.txt", &link) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("symlink fixture requires Windows Developer Mode: {error}");
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("create source symlink: {error}");
+        }
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("symlink");
+        let prepared = cache.prepare(&key, &source, &[]).unwrap();
+        assert_eq!(
+            fs::read(prepared.join("nested/link.txt")).unwrap(),
+            b"linked source"
+        );
+        fs::remove_file(prepared.join(".woodshed-source-tree")).unwrap();
+        #[cfg(windows)]
+        {
+            fs::remove_file(prepared.join("nested/link.txt")).unwrap();
+            fs::write(prepared.join("nested/link.txt"), b"linked source").unwrap();
+        }
+        cache.prepare(&key, &source, &[]).unwrap();
+        assert_eq!(
+            fs::read(prepared.join("nested/link.txt")).unwrap(),
+            b"linked source"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_sources_reject_escaping_duplicate_and_overlapping_mounts() {
+        let root = temp_dir("prepared-invalid");
+        let source = root.join("upstream");
+        fs::create_dir_all(&source).unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("invalid");
+        for paths in [
+            vec![PathBuf::from("../outside")],
+            vec![root.join("absolute")],
+            vec![PathBuf::from("dep"), PathBuf::from("dep")],
+            vec![PathBuf::from("dep"), PathBuf::from("dep/nested")],
+        ] {
+            let mounts = paths
+                .into_iter()
+                .map(|path| (path, source.clone()))
+                .collect::<Vec<_>>();
+            assert!(cache.prepare(&key, &source, &mounts).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_sources_preserve_conflicting_nonempty_directories() {
+        let root = temp_dir("prepared-conflict");
+        let source = root.join("upstream");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(source.join("third_party/library")).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("conflict");
+        let destination = cache
+            .root()
+            .join("prepared")
+            .join(key.as_str())
+            .join("third_party/library");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.h"), b"keep").unwrap();
+        assert!(
+            cache
+                .prepare(
+                    &key,
+                    &source,
+                    &[(PathBuf::from("third_party/library"), dependency)]
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(destination.join("keep.h")).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
     }
 }

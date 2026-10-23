@@ -67,12 +67,16 @@
 #![warn(missing_docs)]
 
 mod archive;
+#[cfg(feature = "bundle")]
+mod bundle;
 mod cache;
 mod dep;
 mod error;
 mod link;
 pub mod probe;
 mod toolchain;
+#[cfg(feature = "bundle")]
+pub use bundle::bundle_cargo;
 
 #[cfg(feature = "cmake")]
 mod cmake;
@@ -93,7 +97,7 @@ pub use link::{
 pub use toolchain::{Toolchain, find_on_path};
 
 #[cfg(feature = "cmake")]
-pub use cmake::{CmakeBuild, MsvcRuntime};
+pub use cmake::{CmakeBuild, ConfiguredCmakeBuild, MsvcRuntime};
 #[cfg(feature = "manifest")]
 pub use dep::Manifest;
 

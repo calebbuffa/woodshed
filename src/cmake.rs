@@ -171,8 +171,13 @@ impl CmakeBuild {
         self
     }
 
-    /// Configure, build, and install. Returns the install prefix.
-    pub fn install(self) -> Result<PathBuf> {
+    /// Configure the project without compiling or installing native targets.
+    ///
+    /// Useful for inspecting generated headers, CMake cache values, and File API
+    /// replies before choosing which targets to build. The caller must hold the
+    /// build directory lock until the returned build has finished. Configuration
+    /// alone does not establish that installed artifacts are complete.
+    pub fn configure(self) -> Result<ConfiguredCmakeBuild> {
         std::fs::create_dir_all(&self.build).map_err(|error| {
             crate::Error::io(format!("cannot create {}", self.build.display()), error)
         })?;
@@ -200,6 +205,55 @@ impl CmakeBuild {
             .apply_to_configure(&mut configure, &self.launcher_define);
         crate::process::check(&mut configure, "cmake configure")?;
 
+        Ok(ConfiguredCmakeBuild {
+            build: self.build,
+            prefix: self.prefix,
+            build_type: self.build_type,
+            target: self.target,
+            toolchain: self.toolchain,
+        })
+    }
+
+    /// Configure, build, and install. Returns the install prefix.
+    pub fn install(self) -> Result<PathBuf> {
+        self.configure()?.build()
+    }
+
+    /// The install prefix this build will produce.
+    pub fn install_prefix(&self) -> &Path {
+        &self.prefix
+    }
+}
+
+/// A successfully configured CMake project, not yet necessarily compiled.
+///
+/// Created by [`CmakeBuild::configure`]. Keep the external build-directory lock
+/// alive across configuration, inspection, and compilation.
+pub struct ConfiguredCmakeBuild {
+    build: PathBuf,
+    prefix: PathBuf,
+    build_type: String,
+    target: Option<String>,
+    toolchain: Toolchain,
+}
+
+impl ConfiguredCmakeBuild {
+    /// Directory containing `CMakeCache.txt` and generated project files.
+    pub fn build_directory(&self) -> &Path {
+        &self.build
+    }
+
+    /// Prefix into which the selected target is expected to install.
+    pub fn install_prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    /// Compile the configured target and return its expected install prefix.
+    ///
+    /// Defaults to the `install` target selected by [`CmakeBuild`]. If the
+    /// builder selected a different target, that target controls whether any
+    /// installation occurs; callers must still check their required artifacts.
+    pub fn build(self) -> Result<PathBuf> {
         let mut build = Command::new("cmake");
         build
             .arg("--build")
@@ -214,9 +268,52 @@ impl CmakeBuild {
 
         Ok(self.prefix)
     }
+}
 
-    /// The install prefix this build will produce.
-    pub fn install_prefix(&self) -> &Path {
-        &self.prefix
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn configure_exposes_metadata_without_building_targets() {
+        let root = env::temp_dir().join(format!(
+            "woodshed-configure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("CMakeLists.txt"),
+            r#"
+    cmake_minimum_required(VERSION 3.15)
+    project(woodshed_configure_test NONE)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/configured.txt" "configured")
+    add_custom_target(artifacts
+      COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/compiled.txt")
+    "#,
+        )
+        .unwrap();
+        let dirs = crate::BuildDirs {
+            build: root.join("build"),
+            prefix: root.join("prefix"),
+        };
+        let guard = dirs.lock().unwrap();
+        let configured = CmakeBuild::new(&source, &dirs)
+            .target(Some("artifacts"))
+            .configure()
+            .unwrap();
+        assert_eq!(configured.build_directory(), dirs.build);
+        assert_eq!(configured.install_prefix(), dirs.prefix);
+        assert!(dirs.build.join("configured.txt").is_file());
+        assert!(!dirs.build.join("compiled.txt").exists());
+        assert_eq!(configured.build().unwrap(), dirs.prefix);
+        assert!(dirs.build.join("compiled.txt").is_file());
+        drop(guard);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

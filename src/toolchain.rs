@@ -35,7 +35,10 @@ impl Toolchain {
             .or_else(|| (!is_msvc).then(|| find_on_path("ccache")).flatten());
 
         Self {
-            generator: ninja.map(|_| "Ninja".to_string()),
+            generator: env::var("CMAKE_GENERATOR")
+                .ok()
+                .filter(|generator| !generator.trim().is_empty())
+                .or_else(|| ninja.map(|_| "Ninja".to_string())),
             compiler_launcher,
             jobs: thread::available_parallelism().map_or(1, |n| n.get()),
         }
@@ -80,15 +83,9 @@ impl Toolchain {
         let existing_home = existing
             .lines()
             .find_map(|line| line.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
-            .unwrap_or("")
-            .to_lowercase();
-        let desired_home = source_dir
-            .canonicalize()
-            .unwrap_or_else(|_| source_dir.to_path_buf())
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_lowercase();
-        let source_moved = !existing_home.is_empty() && existing_home != desired_home;
+            .unwrap_or("");
+        let source_moved = !existing_home.is_empty()
+            && !same_source_directory(Path::new(existing_home), source_dir);
 
         if generator_changed || source_moved {
             eprintln!(
@@ -98,7 +95,32 @@ impl Toolchain {
             force_recreate_dir(build_dir);
         }
     }
+}
 
+fn same_source_directory(existing: &Path, desired: &Path) -> bool {
+    let existing = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    let desired = desired
+        .canonicalize()
+        .unwrap_or_else(|_| desired.to_path_buf());
+    normalize_cmake_path(&existing.to_string_lossy(), cfg!(windows))
+        == normalize_cmake_path(&desired.to_string_lossy(), cfg!(windows))
+}
+
+fn normalize_cmake_path(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_owned();
+    }
+    let path = path.replace('\\', "/").to_lowercase();
+    if let Some(unc) = path.strip_prefix("//?/unc/") {
+        format!("//{unc}")
+    } else {
+        path.strip_prefix("//?/").unwrap_or(&path).to_owned()
+    }
+}
+
+impl Toolchain {
     /// Append this choice's flags to a `cmake -S -B ...` command.
     ///
     /// `compiler_launcher_define` is the cache variable the project reads for
@@ -200,6 +222,73 @@ fn force_recreate_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmake_paths_preserve_unix_case_and_backslashes() {
+        assert_ne!(
+            normalize_cmake_path("/tmp/Source", false),
+            normalize_cmake_path("/tmp/source", false)
+        );
+        assert_ne!(
+            normalize_cmake_path("/tmp/a\\b", false),
+            normalize_cmake_path("/tmp/a/b", false)
+        );
+    }
+
+    #[test]
+    fn cmake_paths_match_windows_verbatim_and_unc_spellings() {
+        assert_eq!(
+            normalize_cmake_path(r"\\?\C:\Users\Example\Source", true),
+            normalize_cmake_path("C:/Users/example/Source", true)
+        );
+        assert_eq!(
+            normalize_cmake_path(r"\\?\UNC\Server\Share\Source", true),
+            normalize_cmake_path("//server/share/source", true)
+        );
+        assert_ne!(
+            normalize_cmake_path("C:/one", true),
+            normalize_cmake_path("D:/one", true)
+        );
+    }
+
+    #[test]
+    fn identical_cmake_source_keeps_cached_build_files() {
+        let root = env::temp_dir().join(format!(
+            "woodshed-cmake-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source = root.join("source");
+        let build = root.join("build");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        let home = source.to_string_lossy().replace('\\', "/");
+        fs::write(
+            build.join("CMakeCache.txt"),
+            format!("CMAKE_GENERATOR:INTERNAL=Ninja\nCMAKE_HOME_DIRECTORY:INTERNAL={home}\n"),
+        )
+        .unwrap();
+        let sentinel = build.join("compiled-object");
+        fs::write(&sentinel, b"keep").unwrap();
+        let toolchain = Toolchain {
+            generator: Some("Ninja".into()),
+            compiler_launcher: None,
+            jobs: 1,
+        };
+        toolchain.reset_build_dir_if_stale(&build, &source);
+        assert!(
+            sentinel.is_file(),
+            "equivalent source spellings must preserve the build"
+        );
+        fs::remove_file(sentinel).unwrap();
+        fs::remove_file(build.join("CMakeCache.txt")).unwrap();
+        fs::remove_dir(build).unwrap();
+        fs::remove_dir(source).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn find_on_path_locates_a_real_tool() {
