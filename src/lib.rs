@@ -40,7 +40,8 @@
 //! # Example
 //!
 //! ```no_run
-//! # fn main() -> woodshed::Result<()> {
+//! # #[cfg(all(feature = "cmake", feature = "manifest"))]
+//! # fn example() -> woodshed::Result<()> {
 //! use woodshed::{BuildKey, Cache, CmakeBuild, Manifest};
 //!
 //! let manifest = Manifest::load_default(std::env::var("CARGO_MANIFEST_DIR").unwrap())?;
@@ -62,6 +63,7 @@
 //! println!("cargo:rustc-link-search=native={}/lib", dirs.prefix.display());
 //! # Ok(())
 //! # }
+//! # fn main() {}
 //! ```
 
 #![warn(missing_docs)]
@@ -72,12 +74,16 @@ mod bundle;
 mod cache;
 mod dep;
 mod error;
+#[cfg(feature = "git")]
+pub mod git;
 mod link;
 pub mod probe;
 mod toolchain;
 #[cfg(feature = "bundle")]
 pub use bundle::bundle_cargo;
 
+#[cfg(feature = "build")]
+mod build;
 #[cfg(feature = "cmake")]
 mod cmake;
 #[cfg(feature = "download")]
@@ -86,9 +92,17 @@ mod download;
 pub mod pin;
 #[cfg(feature = "process")]
 pub mod process;
+#[cfg(feature = "manifest")]
+pub mod project;
+#[cfg(any(feature = "pin", feature = "package-providers"))]
+pub mod providers;
+#[cfg(feature = "build")]
+pub use build::{build, build_from};
+#[cfg(feature = "cli")]
+pub mod setup;
 
 pub use cache::{BuildDirs, BuildKey, BuildLock, Cache};
-pub use dep::Dep;
+pub use dep::{Dep, FileMatch, FileSelector, GitSource, Resolution, Upstream};
 pub use error::{Error, Result};
 pub use link::{
     Linkage, copy_shared_libs, emit_exe_rpath, emit_link, link_cpp_runtime_for,

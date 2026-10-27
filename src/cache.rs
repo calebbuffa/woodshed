@@ -258,6 +258,14 @@ impl Cache {
     /// verification, so a concurrent or interrupted build never observes a
     /// half-written archive.
     pub fn archive(&self, dep: &Dep) -> Result<PathBuf> {
+        if dep.git.is_some() {
+            return Err(Error::Manifest {
+                detail: format!(
+                    "`{}` is a Git source, not an archive; use Cache::source",
+                    dep.name
+                ),
+            });
+        }
         let dir = self.archives_dir();
         fs::create_dir_all(&dir)
             .map_err(|error| Error::io(format!("cannot create {}", dir.display()), error))?;
@@ -345,6 +353,9 @@ impl Cache {
     /// A tree whose [markers](Dep::markers) are missing is treated as the
     /// debris of an interrupted extraction, deleted, and unpacked again.
     pub fn source(&self, dep: &Dep) -> Result<PathBuf> {
+        if dep.git.is_some() {
+            return self.git_source(dep);
+        }
         let archive = self.archive(dep)?;
 
         let sources = self.sources_dir();
@@ -384,6 +395,63 @@ impl Cache {
             });
         }
         Ok(root)
+    }
+
+    #[cfg(feature = "git")]
+    fn git_source(&self, dep: &Dep) -> Result<PathBuf> {
+        let git = dep.git.as_ref().expect("Git source");
+        crate::dep::validate_revision(&git.revision)?;
+        let dir = self.sources_dir().join(dep.source_dir_name());
+        fs::create_dir_all(self.sources_dir())
+            .map_err(|error| Error::io("create Git source cache", error))?;
+        let _lock = Lock::acquire(&lock_path(&dir, "git"))?;
+        let marker = dir.join(".woodshed-git");
+        let identity = format!("{}\n{}\n", git.repository, git.revision);
+        if marker.is_file()
+            && fs::read_to_string(&marker)
+                .map_err(|error| Error::io("read Git source marker", error))?
+                == identity
+            && dep.markers_present(&dir)
+        {
+            return Ok(dir);
+        }
+        if self.offline {
+            return Err(Error::Offline {
+                detail: format!(
+                    "immutable Git source {} at {} is missing or incomplete; populate {} first",
+                    git.repository,
+                    git.revision,
+                    dir.display()
+                ),
+            });
+        }
+        let snapshot = crate::git::Repository::pinned(&git.repository, &git.revision)?;
+        let stage = tempfile::Builder::new()
+            .prefix(".woodshed-git-")
+            .tempdir_in(self.sources_dir())
+            .map_err(|error| Error::io("stage Git source", error))?;
+        snapshot.export(stage.path())?;
+        if let Some(missing) = dep.missing_marker(stage.path()) {
+            return Err(Error::Incomplete {
+                detail: format!("Git source `{}` lacks marker {missing}", dep.name),
+            });
+        }
+        fs::write(stage.path().join(".woodshed-git"), identity)
+            .map_err(|error| Error::io("mark Git source complete", error))?;
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .map_err(|error| Error::io("remove incomplete Git snapshot", error))?;
+        }
+        fs::rename(stage.path(), &dir).map_err(|error| Error::io("install Git snapshot", error))?;
+        Ok(dir)
+    }
+
+    #[cfg(not(feature = "git"))]
+    fn git_source(&self, dep: &Dep) -> Result<PathBuf> {
+        Err(Error::Tool {
+            what: format!("provision Git source `{}`", dep.name),
+            detail: "enable Woodshed's `git` feature".into(),
+        })
     }
 
     /// Copy a source tree into a stable path under the cache, keyed by `key`.
@@ -620,6 +688,13 @@ impl BuildKey {
     /// Mix in a dependency's pinned identity.
     #[must_use]
     pub fn dep(self, dep: &Dep) -> Self {
+        if let Some(git) = &dep.git {
+            return self
+                .mix("git")
+                .mix(&dep.version)
+                .mix(&git.repository)
+                .mix(&git.revision);
+        }
         self.mix(dep.version.as_bytes()).mix(dep.sha256.as_bytes())
     }
 
@@ -678,7 +753,7 @@ fn project_root(dir: &Path) -> PathBuf {
 /// Two `cargo build` invocations can run concurrently - commonly a build and a
 /// rust-analyzer check - and must not download or extract into the same path
 /// at the same time.
-struct Lock {
+pub(crate) struct Lock {
     file: fs::File,
     #[allow(dead_code)]
     path: PathBuf,
@@ -690,14 +765,14 @@ struct Lock {
 /// the last dot and would collapse distinct targets onto one lock: both
 /// `geos-3.14.1-a1b2c3d4` and `geos-3.14.1-99887766` reduce to
 /// `geos-3.14.build.lock`.
-fn lock_path(path: &Path, kind: &str) -> PathBuf {
+pub(crate) fn lock_path(path: &Path, kind: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{kind}.lock"));
     path.with_file_name(name)
 }
 
 impl Lock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| Error::io(format!("cannot create {}", parent.display()), error))?;

@@ -1,13 +1,24 @@
 //! A pinned native dependency, and the manifest that lists them.
 
+#[cfg(any(feature = "manifest", feature = "git"))]
+pub(crate) fn validate_revision(revision: &str) -> crate::Result<()> {
+    if ![40, 64].contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::Error::Manifest {
+            detail: format!("expected an immutable full Git commit ID, got {revision:?}"),
+        });
+    }
+    Ok(())
+}
+
 /// One pinned native dependency: an exact version, a fixed URL, and the
 /// SHA-256 the download must match.
 ///
 /// There is deliberately no way to express "latest". A build that can change
 /// underneath you is not reproducible, and a download that is not verified is
 /// not safe.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "manifest", derive(serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dep {
     /// Identifier used for cache paths and messages. Filled in from the table
     /// name when loaded via [`Manifest`].
@@ -18,17 +29,22 @@ pub struct Dep {
     /// Fixed download URL. `{version}` and `{name}` are substituted when the
     /// dependency is loaded from a [`Manifest`], so a version bump is a single
     /// edit.
+    #[cfg_attr(feature = "manifest", serde(default))]
     pub url: String,
     /// Expected SHA-256 of the archive, as lowercase hex.
+    #[cfg_attr(feature = "manifest", serde(default))]
     pub sha256: String,
-    /// Files that must exist in the extracted tree for it to count as
-    /// complete. Paths are relative to the project root; a trailing `/` means
-    /// "directory".
-    ///
-    /// This is how an interrupted extraction is told apart from a finished
-    /// one, so name a build-system file and a core source file rather than
-    /// something incidental. Empty means "any successful extraction will do",
-    /// which is weaker but sometimes all you can say.
+    /// Immutable Git source, mutually exclusive with archive URL/checksum.
+    #[cfg_attr(feature = "manifest", serde(default))]
+    pub git: Option<GitSource>,
+    /// Upstream Git metadata used by maintainer commands for archive sources.
+    /// Builds do not resolve tags or branches.
+    #[cfg_attr(feature = "manifest", serde(default))]
+    pub upstream: Option<Upstream>,
+    /// How a maintainer bump of another dependency resolves this source.
+    #[cfg_attr(feature = "manifest", serde(default))]
+    pub resolve: Option<Resolution>,
+    /// Files proving a complete source extraction; trailing `/` means directory.
     #[cfg_attr(feature = "manifest", serde(default))]
     pub markers: Vec<String>,
     /// Override the cached archive's filename. Defaults to the URL basename;
@@ -50,9 +66,27 @@ impl Dep {
             version: version.into(),
             url: url.into(),
             sha256: sha256.into(),
+            git: None,
+            upstream: None,
+            resolve: None,
             markers: Vec::new(),
             file: None,
         }
+    }
+
+    /// Pin a Git source to an immutable commit. Requires feature `git` to provision.
+    pub fn git(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        repository: impl Into<String>,
+        revision: impl Into<String>,
+    ) -> Self {
+        let mut dep = Self::new(name, version, "", "");
+        dep.git = Some(GitSource {
+            repository: repository.into(),
+            revision: revision.into(),
+        });
+        dep
     }
 
     /// Set the files that prove an extraction finished.
@@ -77,6 +111,9 @@ impl Dep {
     pub fn expand_templates(&mut self) {
         let sub = |s: &str, v: &str, n: &str| s.replace("{version}", v).replace("{name}", n);
         self.url = sub(&self.url, &self.version, &self.name);
+        if let Some(upstream) = &self.upstream {
+            self.url = self.url.replace("{revision}", &upstream.revision);
+        }
         if let Some(file) = &self.file {
             self.file = Some(sub(file, &self.version, &self.name));
         }
@@ -96,9 +133,164 @@ impl Dep {
 
     /// Directory name for this dependency's extracted source.
     pub(crate) fn source_dir_name(&self) -> String {
+        if let Some(git) = &self.git {
+            use sha2::{Digest, Sha256};
+            let mut identity = Sha256::new();
+            identity.update(git.repository.as_bytes());
+            identity.update([0]);
+            identity.update(git.revision.as_bytes());
+            return format!("{}-git-{:x}", self.name, identity.finalize());
+        }
         format!("{}-{}", self.name, self.version)
     }
+}
 
+/// An immutable Git snapshot; floating refs are resolved only by maintainer commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "manifest", serde(deny_unknown_fields))]
+pub struct GitSource {
+    /// Repository URL (or explicit local repository path).
+    pub repository: String,
+    /// Full commit object ID, never a moving branch or tag.
+    pub revision: String,
+}
+
+/// Git provenance and release-ref policy for an archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "manifest", serde(deny_unknown_fields))]
+pub struct Upstream {
+    /// Repository containing the release and its dependency metadata.
+    pub repository: String,
+    /// Recorded immutable commit used for `{revision}` in archive URLs.
+    pub revision: String,
+    /// Ref template used on bump, e.g. `v{version}`. Omit to use the new version.
+    #[cfg_attr(feature = "manifest", serde(default))]
+    pub reference: Option<String>,
+}
+
+/// Select exactly one value from an upstream UTF-8 file.
+///
+/// Choose `cmake-variable`, `cmake-url`, or the advanced `pattern` escape hatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "manifest", serde(deny_unknown_fields))]
+pub struct FileMatch {
+    /// Repository-relative file path.
+    pub path: String,
+    /// Exactly one extraction method.
+    #[cfg_attr(feature = "manifest", serde(flatten))]
+    pub select: Box<FileSelector>,
+}
+
+/// Readable metadata selectors, with regex available for unusual file formats.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "manifest", serde(rename_all = "kebab-case"))]
+pub enum FileSelector {
+    /// Regex with exactly one capturing group; exactly one match is required.
+    Pattern(String),
+    /// Name in a literal CMake `set(NAME value)` declaration.
+    CmakeVariable(String),
+    /// Dependency name in `FetchContent_Declare(name URL value)`.
+    CmakeUrl(String),
+}
+
+impl FileMatch {
+    /// Regex escape hatch, if selected.
+    pub fn pattern(&self) -> Option<&str> {
+        match self.select.as_ref() {
+            FileSelector::Pattern(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Selected CMake variable name, if any.
+    pub fn cmake_variable(&self) -> Option<&str> {
+        match self.select.as_ref() {
+            FileSelector::CmakeVariable(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Selected FetchContent dependency name, if any.
+    pub fn cmake_url(&self) -> Option<&str> {
+        match self.select.as_ref() {
+            FileSelector::CmakeUrl(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "manifest")]
+impl FileMatch {
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        for name in [self.cmake_variable(), self.cmake_url()]
+            .into_iter()
+            .flatten()
+        {
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || "_-.".contains(c)))
+            {
+                return Err(crate::Error::Manifest {
+                    detail: format!(
+                        "{}: CMake selector must name a variable or dependency, not an expression",
+                        self.path
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Declarative dependency relationships evaluated during a parent bump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "manifest",
+    serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)
+)]
+pub enum Resolution {
+    /// Read an exact gitlink and its repository URL from `.gitmodules`.
+    Gitlink {
+        /// Name of the parent manifest entry.
+        parent: String,
+        /// Repository-relative submodule path.
+        path: String,
+        /// Archive URL template using `{repository}` and `{revision}`.
+        /// Omit to provision this dependency from Git.
+        #[cfg_attr(feature = "manifest", serde(default))]
+        archive: Option<String>,
+    },
+    /// Read a pinned revision and optionally its archive URL from parent files.
+    File {
+        /// Name of the parent manifest entry.
+        parent: String,
+        /// Exact revision capture.
+        revision: FileMatch,
+        /// Optional upstream URL capture; otherwise retain the entry's URL template.
+        #[cfg_attr(feature = "manifest", serde(default))]
+        url: Option<FileMatch>,
+        /// Literal upstream URL placeholder to substitute with the revision.
+        #[cfg_attr(feature = "manifest", serde(default))]
+        placeholder: Option<String>,
+    },
+}
+
+impl Resolution {
+    /// Name of the parent source.
+    pub fn parent(&self) -> &str {
+        match self {
+            Self::Gitlink { parent, .. } | Self::File { parent, .. } => parent,
+        }
+    }
+}
+
+impl Dep {
     /// Whether every marker is present under `root`.
     pub(crate) fn markers_present(&self, root: &std::path::Path) -> bool {
         self.missing_marker(root).is_none()
@@ -142,14 +334,33 @@ impl Manifest {
     /// Load a manifest from an explicit path.
     pub fn load(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
         let path = path.as_ref();
+        if path.file_name().is_some_and(|name| name == "woodshed.toml") {
+            return crate::project::Project::load(path)?.locked_sources();
+        }
         let text = std::fs::read_to_string(path)
             .map_err(|error| crate::Error::io(format!("cannot read {}", path.display()), error))?;
+        let document: toml::Value =
+            toml::from_str(&text).map_err(|error| crate::Error::Manifest {
+                detail: error.to_string(),
+            })?;
+        if document.get("dependencies").is_some() {
+            return crate::project::Project::parse(path, &text)?.locked_sources();
+        }
         Self::parse(&text)
     }
 
-    /// Load `native/versions.toml` relative to a crate's manifest directory.
+    /// Load root/native `woodshed.toml` plus its lock, falling back to legacy
+    /// `native/versions.toml` only when no declaration file exists.
     /// That is the conventional location; [`Manifest::load`] accepts any path.
     pub fn load_default(manifest_dir: impl AsRef<std::path::Path>) -> crate::Result<Self> {
+        let root = manifest_dir.as_ref().join("woodshed.toml");
+        if root.is_file() {
+            return Self::load(root);
+        }
+        let declaration = manifest_dir.as_ref().join("native").join("woodshed.toml");
+        if declaration.is_file() {
+            return Self::load(declaration);
+        }
         Self::load(manifest_dir.as_ref().join("native").join("versions.toml"))
     }
 
@@ -166,7 +377,48 @@ impl Manifest {
                 dep.expand_templates();
                 (name, dep)
             })
-            .collect();
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for dep in deps.values() {
+            if let Some(git) = &dep.git {
+                validate_revision(&git.revision)?;
+                if git.repository.is_empty() || !dep.url.is_empty() || !dep.sha256.is_empty() {
+                    return Err(crate::Error::Manifest {
+                        detail: format!(
+                            "`[{}]` must select either git or archive, not both",
+                            dep.name
+                        ),
+                    });
+                }
+            } else if dep.url.is_empty() || dep.sha256.is_empty() {
+                return Err(crate::Error::Manifest {
+                    detail: format!(
+                        "`[{}]` needs an archive URL and checksum or git source",
+                        dep.name
+                    ),
+                });
+            }
+            if let Some(upstream) = &dep.upstream {
+                validate_revision(&upstream.revision)?;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let mut node = dep;
+            while let Some(rule) = &node.resolve {
+                if !seen.insert(node.name.as_str()) {
+                    return Err(crate::Error::Manifest {
+                        detail: format!("dependency resolution cycle at `{}`", node.name),
+                    });
+                }
+                node = deps
+                    .get(rule.parent())
+                    .ok_or_else(|| crate::Error::Manifest {
+                        detail: format!(
+                            "`[{}]` has unknown resolution parent `{}`",
+                            node.name,
+                            rule.parent()
+                        ),
+                    })?;
+            }
+        }
         Ok(Self { deps })
     }
 

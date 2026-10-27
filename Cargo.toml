@@ -1,7 +1,7 @@
 [package]
 name = "woodshed"
 description = "Build-script toolkit for vendoring, caching, and building native C/C++ dependencies from source"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ repository = "https://github.com/calebbuffa/woodshed"
 [features]
 default = ["manifest", "download", "tar-gz"]
 
-# Parse a pinned-dependency manifest (`versions.toml`).
+# Read declarations/locks, with legacy pinned `versions.toml` compatibility.
 manifest = ["dep:toml", "dep:serde"]
 # Fetch archives over HTTPS.
 download = ["dep:ureq"]
@@ -24,15 +24,23 @@ tar-xz = ["dep:tar", "dep:liblzma"]
 zip = ["dep:zip"]
 # Drive CMake, with the MSVC runtime tied to the Rust target's CRT.
 cmake = ["process"]
+# Declarative CMake source builds and the one-line Cargo build bridge.
+build = ["package-providers"]
 # Run child processes so Ctrl+C tears down the whole build tree.
 process = ["dep:ctrlc", "dep:libc"]
 # Discover an already-installed native library.
-vcpkg = ["dep:vcpkg"]
+vcpkg = ["dep:vcpkg", "package-providers"]
+# Install explicit Conan 2 graphs. The caller supplies the Conan executable.
+conan = ["package-providers"]
+# Shared native-package installation and generated CMake target discovery.
+package-providers = ["manifest", "cmake", "dep:serde_json", "dep:tempfile", "dep:shlex"]
 pkg-config = ["dep:pkg-config"]
-# Maintain `native/versions.toml`: add/bump/verify pins, computing checksums.
-pin = ["manifest", "download", "dep:toml_edit"]
+# Maintain dependency declarations/locks or legacy pins.
+pin = ["manifest", "download", "dep:toml_edit", "dep:tempfile", "dep:regex", "dep:serde_json"]
+# Fetch immutable Git source snapshots and inspect upstream dependency metadata.
+git = ["dep:tempfile", "tar-gz"]
 # The `woodshed` command-line tool (`cargo install woodshed --features cli`).
-cli = ["pin", "bundle"]
+cli = ["pin", "bundle", "dep:clap"]
 # Assemble a Cargo application with declared native runtime resources.
 bundle = ["dep:serde_json", "dep:cargo-config2", "dep:tempfile"]
 
@@ -48,7 +56,10 @@ sha2 = "0.10"
 serde_json = { version = "1", optional = true }
 cargo-config2 = { version = "0.1", optional = true }
 tempfile = { version = "3", optional = true }
+regex = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 fs4 = "0.13"
+shlex = { version = "1.3", optional = true }
 
 serde = { version = "1.0", features = ["derive"], optional = true }
 toml = { version = "0.9", optional = true }
