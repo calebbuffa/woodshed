@@ -29,6 +29,7 @@ impl Server {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                             .unwrap();
@@ -252,6 +253,7 @@ fn ordinary_downstream_build_links_runs_reuses_repairs_and_changes_option_identi
             .arg(subcommand)
             .arg("--quiet")
             .env("WOODSHED_CACHE", &cache)
+            .env("CARGO_NET_OFFLINE", "true")
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", root.join("target"));
         command
@@ -259,7 +261,7 @@ fn ordinary_downstream_build_links_runs_reuses_repairs_and_changes_option_identi
     let first = checked(&mut cargo("run"));
     assert_eq!(String::from_utf8_lossy(&first.stdout).trim(), "41");
     let builds = || {
-        fs::read_dir(cache.join("builds"))
+        fs::read_dir(cache.join("artifacts"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir() && path.join("woodshed-installation.json").is_file())
@@ -267,16 +269,18 @@ fn ordinary_downstream_build_links_runs_reuses_repairs_and_changes_option_identi
     };
     let initial = builds();
     assert_eq!(initial.len(), 1);
-    let count = fs::read(initial[0].join("configure-count.txt")).unwrap();
+    let workspace = fs::read_dir(cache.join("workspaces"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("build/configure-count.txt"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let count = fs::read(&workspace).unwrap();
     // Force Cargo to invoke the bridge again, not just reuse its own output.
     let build_script = fs::read_to_string(root.join("build.rs")).unwrap();
     fs::write(root.join("build.rs"), format!("{build_script}\n")).unwrap();
     let second = checked(&mut cargo("run"));
     assert_eq!(String::from_utf8_lossy(&second.stdout).trim(), "41");
-    assert_eq!(
-        fs::read(initial[0].join("configure-count.txt")).unwrap(),
-        count
-    );
+    assert_eq!(fs::read(&workspace).unwrap(), count);
     fs::remove_file(initial[0].join("prefix/include/demo.h")).unwrap();
     fs::write(root.join("build.rs"), format!("{build_script}\n\n")).unwrap();
     let repaired = checked(&mut cargo("run"));

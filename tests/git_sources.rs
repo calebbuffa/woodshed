@@ -205,24 +205,27 @@ fn missing_git_marker_or_bad_revision_never_produces_a_complete_source() {
 fn generic_add_and_bump_resolve_live_local_refs_then_build_from_immutable_commits() {
     let repositories = Repositories::new();
     let directory = tempfile::tempdir().unwrap();
-    let manifest = directory.path().join("versions.toml");
-    fs::write(&manifest, "# fixture\n").unwrap();
-    let selection = woodshed::pin::Selection {
+    let manifest = directory.path().join("woodshed.toml");
+    let source = woodshed::project::Source {
+        version: Some("1.0.0".into()),
         git: Some(repositories.parent.to_string_lossy().into_owned()),
         reference: Some("v1.0.0".into()),
+        markers: vec!["CMakeLists.txt".into()],
         ..Default::default()
     };
-    let plan = woodshed::pin::plan_add(
+    let plan = woodshed::project::plan_add(
         &manifest,
         "fixture",
-        "1.0.0",
-        &selection,
-        &["CMakeLists.txt".into()],
+        woodshed::project::Dependency::Source(Box::new(source)),
         &mut woodshed::pin::Online::default(),
     )
     .unwrap();
     plan.apply().unwrap();
-    let pins = woodshed::Manifest::load(&manifest).unwrap();
+    let pins = woodshed::project::Project::load(&manifest)
+        .unwrap()
+        .locked()
+        .unwrap()
+        .sources;
     assert_eq!(
         pins.get("fixture").unwrap().git.as_ref().unwrap().revision,
         repositories.parent_revision
@@ -237,7 +240,7 @@ fn generic_add_and_bump_resolve_live_local_refs_then_build_from_immutable_commit
         &["commit", "--quiet", "-a", "-m", "new release"],
     );
     git(&repositories.parent, &["tag", "v2.0.0"]);
-    let plan = woodshed::pin::plan_bump(
+    let plan = woodshed::project::plan_bump(
         &manifest,
         "fixture",
         "2.0.0",
@@ -249,7 +252,11 @@ fn generic_add_and_bump_resolve_live_local_refs_then_build_from_immutable_commit
     )
     .unwrap();
     plan.apply().unwrap();
-    let pins = woodshed::Manifest::load(manifest).unwrap();
+    let pins = woodshed::project::Project::load(manifest)
+        .unwrap()
+        .locked()
+        .unwrap()
+        .sources;
     let source = Cache::at(directory.path().join("cache"))
         .source(pins.get("fixture").unwrap())
         .unwrap();

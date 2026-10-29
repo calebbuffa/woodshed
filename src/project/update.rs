@@ -45,6 +45,13 @@ impl Update {
                 "declarations or lock changed since planning; rerun instead of overwriting",
             ));
         }
+        for (path, contents) in &self.project.workspace_inputs {
+            if read_optional(path)?.as_ref() != Some(contents) {
+                return Err(invalid(
+                    "workspace declarations changed since planning; rerun instead of overwriting",
+                ));
+            }
+        }
         let declarations = stage(&self.project.path, &self.document)?;
         let lock = stage(&lock_path, &self.lock)?;
         let rollback = self
@@ -141,107 +148,66 @@ pub fn plan_lock(path: &Path, resolver: &mut impl Resolver) -> Result<Update> {
     let project = Project::load(path)?;
     let roots = project
         .declarations
-        .dependencies
-        .keys()
-        .cloned()
+        .all_dependencies()
+        .into_keys()
         .collect::<Vec<_>>();
     resolve(project, None, &roots, resolver)
 }
 
-/// Import an existing pinned source manifest without re-resolving identities or
-/// downloading archives. Original pins remain the trust root for this migration.
-/// The legacy file is retained; callers can remove it after checking the result.
-pub fn plan_migrate(legacy: &Path) -> Result<Update> {
-    let original = std::fs::read_to_string(legacy)
-        .map_err(|error| Error::io("read legacy manifest", error))?;
-    let pins = Manifest::parse(&original)?;
-    let raw = document(&original)?;
-    let path = legacy.with_file_name("woodshed.toml");
-    if path.exists() || path.with_file_name("woodshed.lock").exists() {
+/// Refresh graph/build declarations without resolving or changing any source pins.
+///
+/// The previous declaration text must match the existing lock. Source selection,
+/// dependency IDs and provider inputs must remain unchanged.
+pub fn plan_relock(path: &Path, previous: &str) -> Result<Update> {
+    let project = Project::load(path)?;
+    let prior = Project::parse(path, previous)?;
+    let original_lock = std::fs::read_to_string(project.lock_path())
+        .map_err(|error| Error::io("read lock for pin-preserving refresh", error))?;
+    let mut lock = prior.parse_lock(&original_lock)?;
+    let acquisition = |declarations: &Declarations| -> Result<String> {
+        let dependencies = declarations
+            .all_dependencies()
+            .into_iter()
+            .map(|(name, dependency)| {
+                let mut dependency = dependency.clone();
+                *dependency.selection_mut() = DependencyOptions::default();
+                if let Dependency::Source(source) = &mut dependency {
+                    source.features.clear();
+                    source.default_features = true;
+                    source.build = None;
+                }
+                (name, dependency)
+            })
+            .collect::<BTreeMap<_, _>>();
+        serialize(&dependencies)
+    };
+    if acquisition(&prior.declarations)? != acquisition(&project.declarations)? {
         return Err(invalid(
-            "refusing to overwrite an existing declaration/lock during migration",
+            "pin-preserving refresh requires unchanged source/provider selection and dependency IDs; use woodshed lock to resolve changed inputs",
         ));
     }
-    let mut declarations = Declarations::default();
-    for dep in pins.iter() {
-        let mut source = Source {
-            markers: dep.markers.clone(),
-            resolve: dep.resolve.clone(),
-            ..Source::default()
-        };
-        if matches!(dep.resolve, Some(Resolution::File { url: None, .. })) {
-            source.url = raw[&dep.name]
-                .get("url")
-                .and_then(Item::as_str)
-                .map(str::to_owned);
+    for (name, dependency) in prior.declarations.all_dependencies() {
+        if let Dependency::Package(package) = dependency
+            && lock.packages[&name].input != package.input(path)?
+        {
+            return Err(invalid(format!(
+                "{name}: provider/profile inputs changed; cannot preserve its lock"
+            )));
         }
-        if dep.resolve.is_none() {
-            source.version = Some(dep.version.clone());
-            if let Some(git) = &dep.git {
-                source.git = Some(git.repository.clone());
-                source.rev = Some(git.revision.clone());
-            } else if let Some(upstream) = &dep.upstream {
-                let repository = upstream.repository.strip_prefix("https://github.com/").ok_or_else(|| invalid(
-                    "archive provenance migration supports GitHub release declarations; keep this legacy source or declare an explicit URL"
-                ))?.trim_end_matches(".git");
-                let expected = format!(
-                    "https://github.com/{repository}/archive/{}.tar.gz",
-                    upstream.revision
-                );
-                if dep.url != expected {
-                    return Err(invalid(
-                        "nonstandard release assets need an explicit provider/URL declaration, not guessed migration",
-                    ));
-                }
-                source.github = Some(repository.into());
-                source.reference = upstream.reference.clone();
-            } else {
-                source.url = Some(
-                    raw[&dep.name]["url"]
-                        .as_str()
-                        .ok_or_else(|| invalid("missing archive URL"))?
-                        .into(),
-                );
-            }
-            source.file = raw[&dep.name]
-                .get("file")
-                .and_then(Item::as_str)
-                .map(str::to_owned);
-        }
-        declarations
-            .dependencies
-            .insert(dep.name.clone(), Dependency::Source(source));
     }
-    declarations.validate()?;
-    let document = format!(
-        "# Dependency intent. Resolved commits and checksums live in woodshed.lock.\n{}",
-        serialize(&declarations)?
-    );
-    let lock = Lock {
-        format: 1,
-        input: declarations.digest()?,
-        sources: pins
-            .iter()
-            .cloned()
-            .map(|dep| (dep.name.clone(), dep))
-            .collect(),
-        packages: BTreeMap::new(),
-    };
-    let lock_text = format!(
-        "# Generated by Woodshed from the existing verified source pins.\n{}",
-        serialize(&lock)?
-    );
-    let project = Project {
-        path,
-        declarations,
-        original: None,
-    };
-    project.parse_lock(&lock_text)?;
+    for (name, dependency) in project.declarations.all_dependencies() {
+        if let Dependency::Package(package) = dependency {
+            lock.packages.get_mut(&name).expect("validated lock").input = package.input(path)?;
+        }
+    }
+    lock.input = project.declarations.digest()?;
+    let text = serialize(&lock)?;
+    project.parse_lock(&text)?;
     Ok(Update {
+        document: project.original.clone().expect("loaded declarations"),
         project,
-        original_lock: None,
-        document,
-        lock: lock_text,
+        original_lock: Some(original_lock),
+        lock: text,
         changes: Vec::new(),
     })
 }
@@ -290,6 +256,9 @@ pub fn plan_bump(
         .ok_or_else(|| invalid(format!("no dependency {name}")))?;
     match dependency {
         Dependency::Source(source) => {
+            if source.path.is_some() {
+                return Err(invalid("local path sources have no remote version to bump"));
+            }
             if source.resolve.is_some() {
                 return Err(invalid(format!(
                     "{name} is parent-managed; bump its parent"
@@ -334,7 +303,7 @@ pub fn plan_bump(
                     "package provider bumps accept a version, not source overrides",
                 ));
             }
-            match package {
+            match package.as_mut() {
                 Package::Vcpkg {
                     version: current, ..
                 } => *current = version.into(),
@@ -363,18 +332,21 @@ fn resolve(
         .as_ref()
         .map(|lock| lock.packages.clone())
         .unwrap_or_default();
-    for (name, dependency) in &project.declarations.dependencies {
+    for (name, dependency) in project.declarations.all_dependencies() {
         if let Dependency::Source(source) = dependency {
-            let previous = prior.as_ref().and_then(|lock| lock.sources.get(name));
+            if source.path.is_some() {
+                continue;
+            }
+            let previous = prior.as_ref().and_then(|lock| lock.sources.get(&name));
             sources.insert(
                 name.clone(),
-                if !roots.contains(name) {
+                if !roots.contains(&name) {
                     previous
                         .cloned()
                         .map(Ok)
-                        .unwrap_or_else(|| seed(name, source, previous))?
+                        .unwrap_or_else(|| seed(&name, source, previous))?
                 } else {
-                    let mut seeded = seed(name, source, previous)?;
+                    let mut seeded = seed(&name, source, previous)?;
                     if let Some(previous) = previous {
                         seeded.version = previous.version.clone();
                     }
@@ -386,7 +358,8 @@ fn resolve(
     let mut text = serialize(&sources)?;
     let mut changes = Vec::new();
     for name in roots {
-        match &project.declarations.dependencies[name] {
+        match project.declarations.all_dependencies()[name] {
+            Dependency::Source(source) if source.path.is_some() => {}
             Dependency::Source(source) if source.resolve.is_none() => {
                 let reference = source
                     .rev
@@ -399,7 +372,7 @@ fn resolve(
                     })
                     .or_else(|| source.tag.as_ref().map(|tag| format!("refs/tags/{tag}")))
                     .or_else(|| source.reference.clone());
-                let pins = Manifest::parse(&text)?;
+                let pins = SourcePins::parse(&text)?;
                 let version = source
                     .version
                     .as_deref()
@@ -411,8 +384,6 @@ fn resolve(
                     file: source.file.clone(),
                 };
                 let plan = crate::pin::plan_bump_document(
-                    &project.path,
-                    None,
                     document(&text)?,
                     &pins,
                     name,
@@ -435,7 +406,7 @@ fn resolve(
             }
         }
     }
-    let sources = Manifest::parse(&text)?
+    let sources = SourcePins::parse(&text)?
         .iter()
         .cloned()
         .map(|dep| (dep.name.clone(), dep))
@@ -466,9 +437,7 @@ fn resolve(
         let old = project
             .original
             .as_deref()
-            .map(|text| {
-                toml::from_str::<Declarations>(text).map_err(|error| invalid(error.to_string()))
-            })
+            .map(|text| Project::parse(&project.path, text).map(|project| project.declarations))
             .transpose()?;
         if old
             .as_ref()
@@ -477,6 +446,17 @@ fn resolve(
             .transpose()?
             != Some(serialize(dependency)?)
         {
+            if declaration_document
+                .get("dependencies")
+                .and_then(|dependencies| dependencies.get(name))
+                .and_then(|dependency| dependency.get("workspace"))
+                .and_then(Item::as_bool)
+                == Some(true)
+            {
+                return Err(invalid(format!(
+                    "{name}: edit its workspace.dependencies selection and relock members instead of replacing inherited intent"
+                )));
+            }
             let replacement = document(&serialize(dependency)?)?.as_table().clone();
             let dependencies = declaration_document["dependencies"]
                 .as_table_mut()

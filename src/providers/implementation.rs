@@ -1,5 +1,7 @@
 use super::*;
 use crate::Result;
+#[cfg(any(feature = "vcpkg", feature = "conan"))]
+use crate::project::BuildRole;
 #[cfg(all(feature = "pin", any(feature = "vcpkg", feature = "conan")))]
 use crate::project::PackageLock;
 use crate::project::{CmakePackage, Dependency, PackageLinkage, Project, invalid};
@@ -8,7 +10,7 @@ use serde_json::Value;
 #[cfg(all(feature = "pin", feature = "vcpkg"))]
 use serde_json::json;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
@@ -33,7 +35,7 @@ enum Data {
 pub struct InstallOptions {
     /// Isolated package installation and metadata build directory.
     pub directory: PathBuf,
-    /// Cargo target triple; checked against TARGET when called by a build script.
+    /// Actual role triple; checked against TARGET or HOST in a Cargo build script.
     pub target: String,
     /// Release/Debug configuration to query.
     pub configuration: String,
@@ -76,6 +78,21 @@ impl InstallOptions {
 /// Metadata reported by CMake's evaluated imported-target graph.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Installation {
+    /// Lifetime owner of the reported prefix; provider caches are not source artifacts.
+    #[serde(default)]
+    pub ownership: InstallationOwnership,
+    /// CMake package search roots for downstream native dependencies.
+    #[serde(default)]
+    pub prefixes: Vec<PathBuf>,
+    /// Evaluated CMake CONFIG locations, including transitive exported packages.
+    #[serde(default)]
+    pub cmake_packages: BTreeMap<String, PathBuf>,
+    /// Per-file linkage from typed CMake imported targets, including transitive libraries.
+    #[serde(default)]
+    pub library_linkage: BTreeMap<PathBuf, PackageLinkage>,
+    /// Explicit installed tools, for native host-tool dependencies.
+    #[serde(default)]
+    pub executables: BTreeMap<String, PathBuf>,
     /// Transitive include directories for bindings/native consumers.
     pub include_dirs: Vec<PathBuf>,
     /// Transitive preprocessor definitions.
@@ -89,7 +106,42 @@ pub struct Installation {
     linkage: PackageLinkage,
 }
 
+/// Installation ownership is explicit; only source artifacts use Woodshed publication.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallationOwnership {
+    /// Prefix and lifetime belong to the caller of low-level metadata discovery.
+    #[default]
+    External,
+    /// Prefix and lifetime belong to vcpkg/Conan, not the source artifact store.
+    Provider,
+    /// Content-verified, immutable source installation published by Woodshed.
+    Artifact,
+}
+
 impl Installation {
+    #[cfg(feature = "build")]
+    pub(crate) fn requested_linkage(&self) -> PackageLinkage {
+        self.linkage
+    }
+
+    #[cfg(feature = "build")]
+    pub(crate) fn tools(prefix: &Path, linkage: PackageLinkage) -> Self {
+        Self {
+            ownership: InstallationOwnership::External,
+            prefixes: vec![prefix.to_path_buf()],
+            cmake_packages: BTreeMap::new(),
+            library_linkage: BTreeMap::new(),
+            executables: BTreeMap::new(),
+            include_dirs: Vec::new(),
+            definitions: Vec::new(),
+            compile_flags: Vec::new(),
+            link_arguments: Vec::new(),
+            runtime_directories: Vec::new(),
+            linkage,
+        }
+    }
+
     /// Translate common library arguments to propagating Cargo link directives.
     ///
     /// Refuses arbitrary linker flags instead of silently dropping them or using
@@ -146,7 +198,12 @@ impl Installation {
                         "cargo:rustc-link-search=native={}",
                         path.parent().expect("absolute library").display()
                     ));
-                    let kind = if extension == "a" {
+                    let kind = if let Some(linkage) = self.library_linkage.get(path) {
+                        match linkage {
+                            PackageLinkage::Static => "static",
+                            PackageLinkage::Dynamic => "dylib",
+                        }
+                    } else if extension == "a" {
                         "static"
                     } else if shared {
                         "dylib"
@@ -410,8 +467,8 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
     let options = &absolute_options;
     let project = Project::load(manifest)?;
     let lock = project.locked()?;
-    let package = match project.declarations.dependencies.get(name) {
-        Some(Dependency::Package(package)) => package,
+    let package = match project.declarations.all_dependencies().get(name).copied() {
+        Some(Dependency::Package(package)) => package.as_ref(),
         _ => {
             return Err(invalid(format!(
                 "{name} is not a package-provider dependency"
@@ -461,11 +518,16 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
             "provider installation requires an explicit target and standard CMake configuration",
         ));
     }
-    if let Ok(target) = std::env::var("TARGET")
+    let expected_variable = if package.selection().role == crate::project::BuildRole::Host {
+        "HOST"
+    } else {
+        "TARGET"
+    };
+    if let Ok(target) = std::env::var(expected_variable)
         && target != options.target
     {
         return Err(invalid(format!(
-            "provider target {} does not match Cargo TARGET {target}",
+            "provider target {} does not match Cargo {expected_variable} {target}",
             options.target
         )));
     }
@@ -484,6 +546,7 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
     }
     let mut defines = Vec::new();
     let mut runtime_directories: Vec<PathBuf> = Vec::new();
+    let mut package_prefixes = Vec::new();
     match (package, data) {
         #[cfg(feature = "vcpkg")]
         (
@@ -513,7 +576,7 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
                 ));
             }
             validate_vcpkg_root(&root)?;
-            validate_triplet(triplet, &options.target)?;
+            validate_triplet(triplet, &options.target, package.selection().role)?;
             json_write(&options.directory.join("vcpkg.json"), &manifest)?;
             let installed = options.directory.join("installed");
             let mut command = Command::new(vcpkg_exe(&root));
@@ -551,6 +614,7 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
                 "WOODSHED_PACKAGE_PREFIX".into(),
                 installed.join(triplet).into_os_string(),
             ));
+            package_prefixes.push(installed.join(triplet));
             let runtime = installed.join(triplet);
             runtime_directories.push(if options.configuration == "Debug" {
                 runtime.join("debug").join("bin")
@@ -595,34 +659,10 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
             }
             check(&mut command, "install locked Conan graph")?;
             let graph = json_read(&graph)?;
-            validate_conan_target(&graph, &options.target)?;
-            for node in graph["graph"]["nodes"]
-                .as_object()
-                .ok_or_else(|| invalid("missing Conan graph nodes"))?
-                .values()
-            {
-                if node["context"].as_str() != Some("host") {
-                    continue;
-                }
-                if let (Some(folder), Some(components)) = (
-                    node["package_folder"].as_str(),
-                    node["cpp_info"].as_object(),
-                ) {
-                    for component in components.values() {
-                        for field in ["bindirs", "libdirs"] {
-                            if let Some(directories) = component[field].as_array() {
-                                for directory in directories {
-                                    runtime_directories.push(Path::new(folder).join(
-                                        directory.as_str().ok_or_else(|| {
-                                            invalid("invalid Conan runtime directory")
-                                        })?,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            validate_conan_target(&graph, &options.target, package.selection().role)?;
+            let (prefixes, runtime) = conan_package_paths(&graph)?;
+            package_prefixes.extend(prefixes);
+            runtime_directories.extend(runtime);
             defines.push((
                 "CMAKE_TOOLCHAIN_FILE".into(),
                 options
@@ -659,6 +699,12 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
         }
     }
     let mut installation = discover(package.cmake(), options, &defines, &identity.as_str())?;
+    installation.ownership = InstallationOwnership::Provider;
+    for prefix in package_prefixes {
+        if !installation.prefixes.contains(&prefix) {
+            installation.prefixes.push(prefix);
+        }
+    }
     runtime_directories.retain(|path| path.is_dir());
     runtime_directories.sort();
     runtime_directories.dedup();
@@ -666,12 +712,51 @@ pub fn install(manifest: &Path, name: &str, options: &InstallOptions) -> Result<
     Ok(installation)
 }
 
+#[cfg(feature = "conan")]
+fn conan_package_paths(graph: &Value) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut prefixes = Vec::new();
+    let mut runtime = Vec::new();
+    for node in graph["graph"]["nodes"]
+        .as_object()
+        .ok_or_else(|| invalid("missing Conan graph nodes"))?
+        .values()
+    {
+        if node["context"].as_str() != Some("host") {
+            continue;
+        }
+        let Some(folder) = node["package_folder"].as_str() else {
+            continue;
+        };
+        prefixes.push(PathBuf::from(folder));
+        if let Some(components) = node["cpp_info"].as_object() {
+            for component in components.values() {
+                for field in ["bindirs", "libdirs"] {
+                    if let Some(directories) = component[field].as_array() {
+                        for directory in directories {
+                            runtime.push(
+                                Path::new(folder).join(
+                                    directory.as_str().ok_or_else(|| {
+                                        invalid("invalid Conan runtime directory")
+                                    })?,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    Ok((prefixes, runtime))
+}
+
 /// Report a disabled provider without falling back to an unrelated source build.
 #[cfg(not(any(feature = "vcpkg", feature = "conan")))]
 pub fn install(manifest: &Path, name: &str, _: &InstallOptions) -> Result<Installation> {
     let project = Project::load(manifest)?;
     project.locked()?;
-    match project.declarations.dependencies.get(name) {
+    match project.declarations.all_dependencies().get(name).copied() {
         Some(Dependency::Package(package)) => Err(disabled(package)),
         _ => Err(invalid(format!("{name}: not a declared package provider"))),
     }
@@ -683,7 +768,7 @@ fn offline() -> bool {
 }
 
 #[cfg(feature = "vcpkg")]
-fn validate_triplet(triplet: &str, target: &str) -> Result<()> {
+fn validate_triplet(triplet: &str, target: &str, role: BuildRole) -> Result<()> {
     let architecture = if target.starts_with("x86_64-") {
         "x64"
     } else if target.starts_with("aarch64-") {
@@ -734,7 +819,7 @@ fn validate_triplet(triplet: &str, target: &str) -> Result<()> {
     if target.ends_with("-msvc") {
         let static_crt = crate::crt_static();
         let triplet_static_crt = triplet.ends_with("-static");
-        if static_crt != triplet_static_crt {
+        if role == BuildRole::Target && static_crt != triplet_static_crt {
             return Err(invalid(
                 "vcpkg triplet CRT does not match Rust crt-static; use -static or -static-md consistently",
             ));
@@ -744,7 +829,7 @@ fn validate_triplet(triplet: &str, target: &str) -> Result<()> {
 }
 
 #[cfg(feature = "conan")]
-fn validate_conan_target(graph: &Value, target: &str) -> Result<()> {
+fn validate_conan_target(graph: &Value, target: &str, role: BuildRole) -> Result<()> {
     let settings = &graph["graph"]["nodes"]["0"]["settings"];
     let architecture = if target.starts_with("x86_64-") {
         "x86_64"
@@ -771,6 +856,17 @@ fn validate_conan_target(graph: &Value, target: &str) -> Result<()> {
         )));
     }
     if target.ends_with("-msvc")
+        && !matches!(
+            settings["compiler.runtime"].as_str(),
+            Some("static" | "dynamic")
+        )
+    {
+        return Err(invalid(
+            "Conan MSVC profile must declare compiler.runtime=static or dynamic",
+        ));
+    }
+    if role == BuildRole::Target
+        && target.ends_with("-msvc")
         && settings["compiler.runtime"].as_str()
             != Some(if crate::crt_static() {
                 "static"
@@ -793,6 +889,8 @@ pub(crate) fn discover(
 ) -> Result<Installation> {
     let source = options.directory.join("consumer");
     let build = options.directory.join(identity);
+    let toolchain = crate::Toolchain::detect_for_target(&options.target);
+    toolchain.reset_build_dir_if_stale(&build, &source);
     std::fs::create_dir_all(&source)
         .map_err(|error| Error::io("create package metadata consumer", error))?;
     let query = build.join(".cmake").join("api").join("v1").join("query");
@@ -805,8 +903,21 @@ pub(crate) fn discover(
         package.package,
         package.targets.join(" ")
     );
-    write(&source.join("CMakeLists.txt"), &text)?;
+    let expected = match package.linkage {
+        PackageLinkage::Static => "STATIC_LIBRARY",
+        PackageLinkage::Dynamic => "SHARED_LIBRARY",
+    };
+    let text = text
+        + &format!(
+            "set(_woodshed_requested {})\nset(_woodshed_expected {expected})\n",
+            package.targets.join(" ")
+        );
+    write(
+        &source.join("CMakeLists.txt"),
+        &(text + include_str!("metadata.cmake")),
+    )?;
     let mut command = Command::new("cmake");
+    toolchain.apply_to_configure_default(&mut command);
     command
         .arg("-S")
         .arg(&source)
@@ -814,7 +925,9 @@ pub(crate) fn discover(
         .arg(&build)
         .arg(format!("-DCMAKE_BUILD_TYPE={}", options.configuration))
         .arg("-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF")
-        .arg("-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF");
+        .arg("-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF")
+        .arg("-DFETCHCONTENT_FULLY_DISCONNECTED=ON")
+        .arg("-DFETCHCONTENT_UPDATES_DISCONNECTED=ON");
     for (key, value) in defines {
         let mut define = OsString::from(format!("-D{key}="));
         define.push(value);
@@ -867,11 +980,83 @@ pub(crate) fn discover(
                 .ok_or_else(|| invalid("missing CMake target file"))?,
         ),
     )?;
-    metadata(
+    let mut installation = metadata(
         &target,
         package.linkage,
         options.target.contains("-windows-"),
+    )?;
+    installation.prefixes = defines
+        .iter()
+        .filter(|(name, _)| name == "WOODSHED_PACKAGE_PREFIX")
+        .map(|(_, path)| PathBuf::from(path))
+        .collect();
+    let cache = std::fs::read_to_string(build.join("CMakeCache.txt"))
+        .map_err(|error| Error::io("read evaluated package locations", error))?;
+    for line in cache
+        .lines()
+        .filter(|line| !line.starts_with("//") && !line.starts_with('#'))
+    {
+        let Some((declaration, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(name) = declaration
+            .split(':')
+            .next()
+            .and_then(|name| name.strip_suffix("_DIR"))
+        else {
+            continue;
+        };
+        if name.starts_with("CMAKE_") || value.ends_with("-NOTFOUND") {
+            continue;
+        }
+        let path = PathBuf::from(value);
+        if [
+            format!("{name}Config.cmake"),
+            format!("{name}-config.cmake"),
+            format!("{}-config.cmake", name.to_ascii_lowercase()),
+        ]
+        .iter()
+        .any(|file| path.join(file).is_file())
+        {
+            installation.cmake_packages.insert(name.into(), path);
+        }
+    }
+    if !installation.cmake_packages.contains_key(&package.package) {
+        return Err(invalid(format!(
+            "CMake did not report the CONFIG directory for {}",
+            package.package
+        )));
+    }
+    let linkage = std::fs::read_to_string(
+        build.join(format!("woodshed-linkage-{}.txt", options.configuration)),
     )
+    .map_err(|error| Error::io("read evaluated native library types", error))?;
+    for line in linkage.lines() {
+        let (file, kind) = line
+            .split_once('\t')
+            .ok_or_else(|| invalid("invalid evaluated library type record"))?;
+        let file = PathBuf::from(file);
+        let kind = match kind {
+            "static" => PackageLinkage::Static,
+            "dynamic" => PackageLinkage::Dynamic,
+            _ => return Err(invalid("unsupported evaluated native library type")),
+        };
+        if installation
+            .link_arguments
+            .iter()
+            .any(|argument| Path::new(argument) == file)
+            && installation
+                .library_linkage
+                .insert(file.clone(), kind)
+                .is_some_and(|prior| prior != kind)
+        {
+            return Err(invalid(format!(
+                "conflicting CMake library types for {}",
+                file.display()
+            )));
+        }
+    }
+    Ok(installation)
 }
 
 fn metadata(target: &Value, linkage: PackageLinkage, windows: bool) -> Result<Installation> {
@@ -930,6 +1115,11 @@ fn metadata(target: &Value, linkage: PackageLinkage, windows: bool) -> Result<In
         }
     }
     Ok(Installation {
+        ownership: InstallationOwnership::External,
+        prefixes: Vec::new(),
+        cmake_packages: BTreeMap::new(),
+        library_linkage: BTreeMap::new(),
+        executables: BTreeMap::new(),
         include_dirs: includes.into_iter().collect(),
         definitions: definitions.into_iter().collect(),
         compile_flags,

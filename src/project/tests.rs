@@ -2,8 +2,210 @@ use super::*;
 use crate::pin::{Resolver, Selection};
 use std::fs;
 
+fn sources(path: &Path) -> Result<BTreeMap<String, Dep>> {
+    Ok(Project::load(path)?.locked()?.sources)
+}
+
 const COMMIT: &str = "0123456789012345678901234567890123456789";
 const CHILD: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+#[test]
+fn public_source_pins_have_names_matching_resolved_nodes_including_target_variants() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("woodshed.toml");
+    fs::write(
+        &path,
+        r#"
+[dependencies.common]
+git = "https://example.test/common.git"
+branch = "stable"
+[target.x86_64-pc-windows-msvc.dependencies.native]
+git = "https://example.test/windows.git"
+branch = "stable"
+[target.aarch64-unknown-linux-gnu.dependencies.native]
+git = "https://example.test/linux.git"
+branch = "stable"
+"#,
+    )
+    .unwrap();
+    plan_lock(&path, &mut FixtureResolver::default())
+        .unwrap()
+        .apply()
+        .unwrap();
+    let project = Project::load(&path).unwrap();
+    let lock = project.locked().unwrap();
+    for target in ["x86_64-pc-windows-msvc", "aarch64-unknown-linux-gnu"] {
+        let plan = project.resolve(&PlanOptions::new("host", target)).unwrap();
+        assert_eq!(plan.dependencies.len(), 2);
+        for node in plan.dependencies {
+            assert_eq!(lock.sources[&node.id].name, node.name);
+        }
+    }
+}
+
+#[test]
+fn relock_preserves_pins_without_resolution_and_rejects_source_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("woodshed.toml");
+    let original =
+        "[dependencies.native]\ngit='https://example.test/native.git'\nbranch='stable'\n";
+    fs::write(&path, original).unwrap();
+    plan_lock(&path, &mut FixtureResolver::default())
+        .unwrap()
+        .apply()
+        .unwrap();
+    let before = Project::load(&path).unwrap().locked().unwrap();
+    let changed = format!("[features]\ncpu=[]\nextra=['dep:native']\n{original}optional=true\n");
+    fs::write(&path, &changed).unwrap();
+    assert!(Project::load(&path).unwrap().locked().is_err());
+    let update = plan_relock(&path, original).unwrap();
+    assert!(update.changes().is_empty());
+    update.apply().unwrap();
+    let after = Project::load(&path).unwrap().locked().unwrap();
+    assert_eq!(
+        toml::to_string(&before.sources).unwrap(),
+        toml::to_string(&after.sources).unwrap()
+    );
+    assert_ne!(before.input, after.input);
+    fs::write(&path, changed.replace("'stable'", "'next'")).unwrap();
+    assert!(plan_relock(&path, &changed).is_err());
+    fs::write(&path, changed.replace("native.git", "other.git")).unwrap();
+    assert!(plan_relock(&path, &changed).is_err());
+    fs::write(&path, &changed).unwrap();
+    let planned = plan_relock(&path, &changed).unwrap();
+    fs::write(&path, format!("{changed}\n# concurrent edit\n")).unwrap();
+    assert!(planned.apply().is_err());
+    assert!(plan_relock(&path, original).is_err());
+}
+
+#[test]
+fn relock_preserves_provider_data_but_rejects_changed_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("woodshed.toml");
+    let profile = directory.path().join("profile");
+    fs::write(&profile, "[settings]\nos=Windows\n").unwrap();
+    let original = r#"
+[dependencies.codec]
+provider = "conan"
+package = "codec/1.0"
+host-profile = "profile"
+build-profile = "profile"
+cmake = { package = "Codec", targets = ["Codec::Codec"] }
+"#;
+    fs::write(&path, original).unwrap();
+    let project = Project::load(&path).unwrap();
+    let Dependency::Package(package) = &project.declarations.dependencies["codec"] else {
+        unreachable!()
+    };
+    let lock = Lock {
+        format: 1,
+        input: project.declarations.digest().unwrap(),
+        sources: BTreeMap::new(),
+        packages: BTreeMap::from([(
+            "codec".into(),
+            PackageLock {
+                input: package.input(&path).unwrap(),
+                data: "provider-owned locked graph".into(),
+            },
+        )]),
+    };
+    fs::write(project.lock_path(), toml::to_string(&lock).unwrap()).unwrap();
+    let changed = original.replace(
+        "[dependencies.codec]",
+        "[features]\nextra=['dep:codec']\n[dependencies.codec]\noptional=true",
+    );
+    fs::write(&path, &changed).unwrap();
+    plan_relock(&path, original).unwrap().apply().unwrap();
+    let updated = Project::load(&path).unwrap().locked().unwrap();
+    assert_eq!(updated.packages["codec"].data, lock.packages["codec"].data);
+    fs::write(&profile, "[settings]\nos=Linux\n").unwrap();
+    assert!(plan_relock(&path, &changed).is_err());
+}
+
+#[test]
+fn local_sources_lock_offline_without_fake_versions_or_remote_resolver_calls() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("woodshed.toml");
+    fs::write(
+        &path,
+        "[features]\ndefault=['dep:local']\n[dependencies.local]\npath='native'\noptional=true\n",
+    )
+    .unwrap();
+    let mut resolver = FixtureResolver {
+        fail: true,
+        ..Default::default()
+    };
+    plan_lock(&path, &mut resolver).unwrap().apply().unwrap();
+    assert!(resolver.calls.is_empty());
+    let project = Project::load(&path).unwrap();
+    let lock = project.locked().unwrap();
+    assert!(lock.sources.is_empty());
+    assert!(lock.packages.is_empty());
+    assert_eq!(
+        project
+            .resolve(&PlanOptions::new("host", "target"))
+            .unwrap()
+            .dependencies[0]
+            .name,
+        "local"
+    );
+    fs::write(
+        directory.path().join("woodshed.toml"),
+        "[dependencies.local]\npath='other'\n",
+    )
+    .unwrap();
+    assert!(Project::load(&path).unwrap().locked().is_err());
+}
+
+#[test]
+fn lock_pins_every_target_variant_even_when_inactive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("woodshed.toml");
+    let declarations = r#"
+[target.x86_64-pc-windows-msvc.dependencies.native]
+git = "https://example.test/windows.git"
+branch = "stable"
+[target.aarch64-unknown-linux-gnu.dependencies.native]
+url = "https://example.test/linux-{version}.zip"
+version = "1.0"
+"#;
+    fs::write(&path, declarations).unwrap();
+    let mut resolver = FixtureResolver::default();
+    plan_lock(&path, &mut resolver).unwrap().apply().unwrap();
+    assert!(
+        resolver
+            .calls
+            .iter()
+            .any(|call| call.contains("refs/heads/stable"))
+    );
+    assert!(
+        resolver
+            .calls
+            .iter()
+            .any(|call| call.contains("linux-1.0.zip"))
+    );
+    let project = Project::load(&path).unwrap();
+    let lock = project.locked().unwrap();
+    assert_eq!(lock.sources.len(), 2);
+    assert_eq!(
+        lock.sources[&Declarations::target_id("x86_64-pc-windows-msvc", "native")]
+            .git
+            .as_ref()
+            .unwrap()
+            .revision,
+        COMMIT
+    );
+    assert!(
+        project
+            .resolve(&PlanOptions::new("host", "wasm32-unknown-unknown"))
+            .unwrap()
+            .dependencies
+            .is_empty()
+    );
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("[target.x86_64-pc-windows-msvc.dependencies.native]"));
+    assert!(!raw.contains("[dependencies.native"));
+}
 
 #[derive(Default)]
 struct FixtureResolver {
@@ -159,7 +361,7 @@ url = { path = "deps.cmake", cmake-url = "child" }
         literal: false,
     };
     plan_lock(&path, &mut resolver).unwrap().apply().unwrap();
-    let manifest = Manifest::load(&path).unwrap();
+    let manifest = sources(&path).unwrap();
     assert_eq!(manifest.get("child").unwrap().version, CHILD);
     assert_eq!(
         manifest.get("child").unwrap().url,
@@ -202,7 +404,7 @@ fn lock_resolves_release_and_children_without_maintainer_hashes_or_writes_until_
     assert!(!path.with_file_name("woodshed.lock").exists());
     assert_eq!(plan.manifest(), DECLARATIONS);
     plan.apply().unwrap();
-    let pins = Manifest::load(&path).unwrap();
+    let pins = sources(&path).unwrap();
     assert_eq!(pins.get("parent").unwrap().version, "1.0");
     assert_eq!(pins.get("child").unwrap().version, CHILD);
     assert_eq!(
@@ -221,10 +423,12 @@ fn lock_resolves_release_and_children_without_maintainer_hashes_or_writes_until_
     );
     let lock = fs::read_to_string(path.with_file_name("woodshed.lock")).unwrap();
     assert_eq!(
-        Project::parse_locked_sources(DECLARATIONS, &lock)
+        Project::parse(&path, DECLARATIONS)
             .unwrap()
-            .iter()
-            .count(),
+            .parse_lock(&lock)
+            .unwrap()
+            .sources
+            .len(),
         2
     );
     assert_eq!(
@@ -256,11 +460,7 @@ fn bump_updates_intent_and_locked_graph_and_preserves_comments() {
     assert!(!update.manifest().contains("sha256"));
     update.apply().unwrap();
     assert_eq!(
-        Manifest::load(&path)
-            .unwrap()
-            .get("parent")
-            .unwrap()
-            .version,
+        sources(&path).unwrap().get("parent").unwrap().version,
         "2.0"
     );
     assert!(
@@ -322,16 +522,16 @@ fn resolution_failure_and_stale_plans_preserve_both_files() {
 #[test]
 fn missing_stale_and_interrupted_locks_fail_closed_but_comments_do_not_invalidate() {
     let (_directory, path) = create();
-    assert!(Manifest::load(&path).is_err());
+    assert!(sources(&path).is_err());
     plan_lock(&path, &mut FixtureResolver::default())
         .unwrap()
         .apply()
         .unwrap();
     fs::write(&path, format!("# extra comment\n{DECLARATIONS}")).unwrap();
-    Manifest::load(&path).unwrap();
+    sources(&path).unwrap();
     fs::write(&path, DECLARATIONS.replace("1.0", "2.0")).unwrap();
     assert!(
-        Manifest::load(&path)
+        sources(&path)
             .unwrap_err()
             .to_string()
             .contains("does not match")
@@ -350,7 +550,7 @@ fn add_can_create_a_project_and_switch_archive_git_archive_without_duplicate_pin
     let update = plan_add(
         &path,
         "example",
-        Dependency::Source(source),
+        Dependency::Source(Box::new(source)),
         &mut FixtureResolver::default(),
     )
     .unwrap();
@@ -371,7 +571,7 @@ fn add_can_create_a_project_and_switch_archive_git_archive_without_duplicate_pin
     .apply()
     .unwrap();
     assert!(
-        Manifest::load(&path)
+        sources(&path)
             .unwrap()
             .get("example")
             .unwrap()
@@ -392,7 +592,7 @@ fn add_can_create_a_project_and_switch_archive_git_archive_without_duplicate_pin
     .apply()
     .unwrap();
     assert!(
-        Manifest::load(&path)
+        sources(&path)
             .unwrap()
             .get("example")
             .unwrap()
@@ -420,7 +620,7 @@ branch = "main"
             .calls
             .contains(&"https://example.test/source.git:refs/heads/main".into())
     );
-    Manifest::load(&path).unwrap();
+    sources(&path).unwrap();
 }
 
 #[test]
@@ -476,7 +676,7 @@ fn file_managed_sources_can_declare_a_stable_archive_template_without_dummy_pins
         .apply()
         .unwrap();
     assert_eq!(
-        Manifest::load(&path).unwrap().get("child").unwrap().url,
+        sources(&path).unwrap().get("child").unwrap().url,
         format!("https://example.test/{CHILD}.zip")
     );
 }
@@ -488,6 +688,7 @@ fn provider_profiles_are_hashed_and_missing_features_never_fall_back() {
     let profile = directory.path().join("host");
     fs::write(&profile, "[settings]\nos=Windows\narch=x86_64\n").unwrap();
     let package = Package::Conan {
+        selection: Default::default(),
         package: "zlib/1.3.1".into(),
         host_profile: "host".into(),
         build_profile: "host".into(),
@@ -544,44 +745,25 @@ fn failed_second_file_replacement_rolls_back_user_declarations() {
 }
 
 #[test]
-fn migration_preserves_exact_source_identities_and_build_keys_without_network() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("versions.toml");
-    let text = format!(
-        r#"[parent]
-version = "1.0"
-url = "https://github.com/example/parent/archive/{{revision}}.tar.gz"
-sha256 = "{}"
-file = "parent-{{version}}.tar.gz"
-[parent.upstream]
-repository = "https://github.com/example/parent.git"
-revision = "{COMMIT}"
-reference = "v{{version}}"
-"#,
-        "c".repeat(64)
-    );
-    fs::write(&path, &text).unwrap();
-    let pins = Manifest::load(&path).unwrap();
-    let before = crate::BuildKey::new("test")
-        .dep(pins.get("parent").unwrap())
-        .as_str()
-        .to_owned();
-    let update = plan_migrate(&path).unwrap();
-    assert!(!path.with_file_name("woodshed.toml").exists());
-    update.apply().unwrap();
-    let migrated = Manifest::load(path.with_file_name("woodshed.toml")).unwrap();
-    let after = crate::BuildKey::new("test")
-        .dep(migrated.get("parent").unwrap())
-        .as_str()
-        .to_owned();
-    assert_eq!(before, after);
-    assert_eq!(
-        pins.get("parent").unwrap().url,
-        migrated.get("parent").unwrap().url
-    );
-    assert_eq!(
-        pins.get("parent").unwrap().file,
-        migrated.get("parent").unwrap().file
-    );
-    assert_eq!(fs::read_to_string(path).unwrap(), text);
+fn embedded_and_file_lock_apis_agree_on_source_identity_and_build_keys() {
+    let (_directory, path) = create();
+    plan_lock(&path, &mut FixtureResolver::default())
+        .unwrap()
+        .apply()
+        .unwrap();
+    let project = Project::load(&path).unwrap();
+    let loaded = project.locked().unwrap();
+    let embedded = Project::parse(&path, DECLARATIONS)
+        .unwrap()
+        .parse_lock(&fs::read_to_string(project.lock_path()).unwrap())
+        .unwrap();
+    assert_eq!(loaded.sources, embedded.sources);
+    for (id, dep) in &loaded.sources {
+        assert_eq!(
+            crate::BuildKey::new("test").dep(dep).as_str(),
+            crate::BuildKey::new("test")
+                .dep(&embedded.sources[id])
+                .as_str()
+        );
+    }
 }

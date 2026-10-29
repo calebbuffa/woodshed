@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 const BRIDGE: &str = "fn main() -> woodshed::Result<()> {\n    woodshed::build()\n}\n";
 
@@ -135,7 +135,7 @@ pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
         (project.lock_path(), read(&project.lock_path())?),
     ];
     let mut features = std::collections::BTreeSet::from(["build".to_owned()]);
-    for (name, dependency) in &project.declarations.dependencies {
+    for (name, dependency) in project.declarations.all_dependencies() {
         match dependency {
             Dependency::Source(source) => {
                 if source.build.is_none() {
@@ -180,6 +180,20 @@ pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
         features.insert("download".into());
     }
     document["package"]["build"] = value("build.rs");
+    let native_features = project.declarations.feature_names();
+    if !native_features.is_empty() {
+        if document.get("features").is_none() {
+            document["features"] = Item::Table(Table::new());
+        }
+        let cargo_features = document["features"]
+            .as_table_mut()
+            .ok_or_else(|| invalid("Cargo features must be a table"))?;
+        for name in native_features {
+            if !cargo_features.contains_key(&name) {
+                cargo_features[&name] = value(Array::new());
+            }
+        }
+    }
     if document.get("build-dependencies").is_none() {
         document["build-dependencies"] = Item::Table(Table::new());
     }
@@ -218,7 +232,9 @@ pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
     if dep
         .get("version")
         .and_then(Item::as_str)
-        .is_some_and(|version| !["0.3", "^0.3", "0.3.0", "^0.3.0"].contains(&version))
+        .is_some_and(|version| {
+            !["0.3", "^0.3", "0.3.0", "^0.3.0", "0.3.1", "^0.3.1"].contains(&version)
+        })
     {
         return Err(invalid(
             "existing Woodshed version is preserved; upgrade to 0.3 explicitly before setup",

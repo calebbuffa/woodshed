@@ -28,10 +28,14 @@ pub fn run(command: &mut Command, description: &str) -> io::Result<ExitStatus> {
     #[cfg(windows)]
     configure_windows_process_group(command);
 
-    eprintln!("woodshed: starting {description}");
+    let _progress = crate::progress::Phase::new(description);
     let mut child = command.spawn()?;
     ACTIVE_PID.store(child.id(), Ordering::SeqCst);
     let result = child.wait();
+    match &result {
+        Ok(status) => crate::progress::notify(&format!("{description}: exited {status}")),
+        Err(error) => crate::progress::notify(&format!("{description}: wait failed: {error}")),
+    }
     ACTIVE_PID.store(0, Ordering::SeqCst);
     result
 }

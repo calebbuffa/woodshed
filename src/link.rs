@@ -159,7 +159,7 @@ pub fn shared_library_files(prefix: &Path) -> Vec<PathBuf> {
     found
 }
 
-fn is_shared_library(path: &Path) -> bool {
+pub(crate) fn is_shared_library(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };

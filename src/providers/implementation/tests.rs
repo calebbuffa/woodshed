@@ -1,6 +1,33 @@
 use super::*;
 use serde_json::json;
 
+#[cfg(feature = "conan")]
+#[test]
+fn conan_preserves_package_prefixes_for_host_tools_and_transitive_consumers() {
+    let graph = json!({"graph": {"nodes": {
+        "0": {"context": "host", "package_folder": null},
+        "1": {"context": "host", "package_folder": "packages/one",
+            "cpp_info": {"root": {"bindirs": ["bin"], "libdirs": ["lib"]}}},
+        "2": {"context": "build", "package_folder": "build-only"},
+        "3": {"context": "host", "package_folder": "packages/two"}
+    }}});
+    let (prefixes, runtime) = conan_package_paths(&graph).unwrap();
+    assert_eq!(
+        prefixes,
+        [PathBuf::from("packages/one"), PathBuf::from("packages/two")]
+    );
+    assert_eq!(
+        runtime,
+        [
+            PathBuf::from("packages/one/bin"),
+            PathBuf::from("packages/one/lib")
+        ]
+    );
+    let mut invalid = graph;
+    invalid["graph"]["nodes"]["1"]["cpp_info"]["root"]["bindirs"] = json!([42]);
+    assert!(conan_package_paths(&invalid).is_err());
+}
+
 #[test]
 fn evaluated_metadata_preserves_library_order_paths_definitions_and_compile_flags() {
     let data = json!({
@@ -43,6 +70,11 @@ fn evaluated_metadata_preserves_library_order_paths_definitions_and_compile_flag
 #[test]
 fn unsupported_linker_flags_fail_before_partial_cargo_emission() {
     let installation = Installation {
+        cmake_packages: BTreeMap::new(),
+        library_linkage: BTreeMap::new(),
+        ownership: InstallationOwnership::External,
+        prefixes: Vec::new(),
+        executables: BTreeMap::new(),
         include_dirs: Vec::new(),
         definitions: Vec::new(),
         compile_flags: Vec::new(),
@@ -120,23 +152,57 @@ set_target_properties(WoodshedFixture::first PROPERTIES
 #[cfg(feature = "vcpkg")]
 #[test]
 fn vcpkg_rejects_wrong_target_and_unsupported_architecture() {
-    assert!(validate_triplet("x64-windows", "aarch64-pc-windows-msvc").is_err());
-    assert!(validate_triplet("x64-linux", "riscv64gc-unknown-linux-gnu").is_err());
-    assert!(validate_triplet("x64-linux", "x86_64-unknown-linux-gnu").is_ok());
-    assert!(validate_triplet("arm-linux", "armv7-unknown-linux-gnueabihf").is_ok());
-    assert!(validate_triplet("x64-windows", "x86_64-pc-windows-gnu").is_err());
-    assert!(validate_triplet("x64-linux", "x86_64-unknown-linux-musl").is_err());
-    assert!(validate_triplet("x64-linux-custom", "x86_64-unknown-linux-gnu").is_err());
+    assert!(validate_triplet("x64-windows", "aarch64-pc-windows-msvc", BuildRole::Target).is_err());
+    assert!(
+        validate_triplet(
+            "x64-linux",
+            "riscv64gc-unknown-linux-gnu",
+            BuildRole::Target
+        )
+        .is_err()
+    );
+    assert!(validate_triplet("x64-linux", "x86_64-unknown-linux-gnu", BuildRole::Target).is_ok());
+    assert!(
+        validate_triplet(
+            "arm-linux",
+            "armv7-unknown-linux-gnueabihf",
+            BuildRole::Target
+        )
+        .is_ok()
+    );
+    assert!(validate_triplet("x64-windows", "x86_64-pc-windows-gnu", BuildRole::Target).is_err());
+    assert!(validate_triplet("x64-linux", "x86_64-unknown-linux-musl", BuildRole::Target).is_err());
+    assert!(
+        validate_triplet(
+            "x64-linux-custom",
+            "x86_64-unknown-linux-gnu",
+            BuildRole::Target
+        )
+        .is_err()
+    );
+    assert!(
+        validate_triplet(
+            "x64-windows-static",
+            "x86_64-pc-windows-msvc",
+            BuildRole::Host
+        )
+        .is_ok()
+    );
+    assert!(validate_triplet("x64-windows", "x86_64-pc-windows-msvc", BuildRole::Host).is_ok());
 }
 
 #[cfg(feature = "conan")]
 #[test]
 fn conan_rejects_missing_wrong_target_and_crt_profile_settings() {
     let graph = json!({"graph": {"nodes": {"0": {"settings": {"os": "Linux", "arch": "x86_64"}}}}});
-    assert!(validate_conan_target(&graph, "x86_64-unknown-linux-gnu").is_ok());
-    assert!(validate_conan_target(&graph, "aarch64-unknown-linux-gnu").is_err());
-    assert!(validate_conan_target(&json!({}), "x86_64-unknown-linux-gnu").is_err());
-    assert!(validate_conan_target(&graph, "x86_64-pc-windows-msvc").is_err());
+    assert!(validate_conan_target(&graph, "x86_64-unknown-linux-gnu", BuildRole::Target).is_ok());
+    assert!(validate_conan_target(&graph, "aarch64-unknown-linux-gnu", BuildRole::Target).is_err());
+    assert!(
+        validate_conan_target(&json!({}), "x86_64-unknown-linux-gnu", BuildRole::Target).is_err()
+    );
+    assert!(validate_conan_target(&graph, "x86_64-pc-windows-msvc", BuildRole::Target).is_err());
+    let host = json!({"graph": {"nodes": {"0": {"settings": {"os": "Windows", "arch": "x86_64", "compiler.runtime": "static"}}}}});
+    assert!(validate_conan_target(&host, "x86_64-pc-windows-msvc", BuildRole::Host).is_ok());
 }
 
 #[cfg(all(feature = "pin", feature = "vcpkg"))]

@@ -2,13 +2,12 @@
 //!
 //! Builds consume immutable pins. Only explicit maintainer commands resolve
 //! floating refs, discover declared dependents, and compute new checksums.
-use crate::{Dep, Error, FileMatch, GitSource, Manifest, Resolution, Result, Upstream};
+use crate::{Dep, Error, FileMatch, GitSource, Resolution, Result, Upstream, dep::SourcePins};
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::Write,
-    path::{Path, PathBuf},
+    path::Path,
 };
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 mod offline;
 pub use offline::Offline;
@@ -187,85 +186,19 @@ pub struct Change {
     pub upstream: Option<Upstream>,
 }
 
-/// Fully resolved and hashed manifest edit. Inspect it before [`Self::apply`].
-pub struct Plan {
-    path: PathBuf,
-    original: Option<String>,
+pub(crate) struct ResolvedSources {
     document: DocumentMut,
     changes: Vec<Change>,
 }
 
-impl Plan {
-    /// All source changes, including transitively declared dependents.
-    pub fn changes(&self) -> &[Change] {
+impl ResolvedSources {
+    pub(crate) fn changes(&self) -> &[Change] {
         &self.changes
     }
 
-    /// Preview the exact new manifest without modifying it.
-    pub fn manifest(&self) -> String {
+    pub(crate) fn manifest(&self) -> String {
         self.document.to_string()
     }
-
-    /// Commit the complete edit through a temporary sibling file.
-    ///
-    /// Rejects edits made since planning. Replacement is atomic on Windows and
-    /// Unix; no original bytes are truncated on validation/download/write failure.
-    pub fn apply(self) -> Result<()> {
-        Manifest::parse(&self.document.to_string())?;
-        let _lock = crate::cache::Lock::acquire(&crate::cache::lock_path(&self.path, "pin"))?;
-        let current = match std::fs::read_to_string(&self.path) {
-            Ok(text) => Some(text),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::io("reread manifest before committing pins", error)),
-        };
-        if current != self.original {
-            return Err(invalid(
-                "manifest changed since planning; rerun instead of overwriting it",
-            ));
-        }
-        let parent = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|error| Error::io("stage pin manifest", error))?;
-        temporary
-            .write_all(self.document.to_string().as_bytes())
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|error| Error::io("write pin manifest", error))?;
-        if self.original.is_some() {
-            let permissions = std::fs::metadata(&self.path)
-                .map_err(|error| Error::io("inspect pin manifest permissions", error))?
-                .permissions();
-            temporary
-                .as_file()
-                .set_permissions(permissions)
-                .map_err(|error| Error::io("preserve pin manifest permissions", error))?;
-            temporary
-                .persist(&self.path)
-                .map_err(|error| Error::io("replace pin manifest", error.error))?;
-        } else {
-            temporary
-                .persist_noclobber(&self.path)
-                .map_err(|error| Error::io("create pin manifest", error.error))?;
-        }
-        Ok(())
-    }
-}
-
-fn read(path: &Path, allow_missing: bool) -> Result<(Option<String>, DocumentMut)> {
-    let original = match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(Error::io(format!("read {}", path.display()), error)),
-    };
-    let document = original
-        .as_deref()
-        .unwrap_or("")
-        .parse::<DocumentMut>()
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok((original, document))
 }
 
 fn source_metadata(dep: &Dep) -> Result<(&str, &str)> {
@@ -377,32 +310,14 @@ fn retarget(template: &str, old: &str, new: &str, key: &str) -> Result<String> {
     Ok(template.replace(old, new))
 }
 
-/// Plan a root version bump and all declared transitive dependent sources.
-pub fn plan_bump(
-    manifest: &Path,
-    name: &str,
-    version: &str,
-    selection: &Selection,
-    resolver: &mut impl Resolver,
-) -> Result<Plan> {
-    let (original, document) = read(manifest, false)?;
-    let pins = Manifest::parse(original.as_deref().unwrap_or(""))?;
-    plan_bump_document(
-        manifest, original, document, &pins, name, version, selection, resolver,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_bump_document(
-    manifest: &Path,
-    original: Option<String>,
     document: DocumentMut,
-    pins: &Manifest,
+    pins: &SourcePins,
     name: &str,
     version: &str,
     selection: &Selection,
     resolver: &mut impl Resolver,
-) -> Result<Plan> {
+) -> Result<ResolvedSources> {
     let current = pins.get(name)?;
     if let Some(rule) = &current.resolve {
         return Err(invalid(format!(
@@ -491,18 +406,16 @@ pub(crate) fn plan_bump_document(
             *file = retarget(file, &current.version, version, "file")?;
         }
     }
-    finish(manifest, original, document, pins, root, raw_url, resolver)
+    finish(document, pins, root, raw_url, resolver)
 }
 
 fn finish(
-    manifest: &Path,
-    original: Option<String>,
     mut document: DocumentMut,
-    pins: &Manifest,
+    pins: &SourcePins,
     root: Dep,
     raw_url: String,
     resolver: &mut impl Resolver,
-) -> Result<Plan> {
+) -> Result<ResolvedSources> {
     let mut sources = BTreeMap::from([(root.name.clone(), (root.clone(), raw_url))]);
     let mut pending = VecDeque::from([root.name]);
     while let Some(parent_name) = pending.pop_front() {
@@ -663,140 +576,15 @@ fn finish(
             upstream: dep.upstream,
         });
     }
-    Manifest::parse(&document.to_string())?;
-    Ok(Plan {
-        path: manifest.into(),
-        original,
-        document,
-        changes,
-    })
-}
-
-/// Plan a new archive or Git dependency using the same transaction as `bump`.
-/// Existing manifests may be empty.
-pub fn plan_add(
-    manifest: &Path,
-    name: &str,
-    version: &str,
-    selection: &Selection,
-    markers: &[String],
-    resolver: &mut impl Resolver,
-) -> Result<Plan> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-    {
-        return Err(invalid(
-            "dependency names must contain only letters, numbers, '-' and '_'",
-        ));
-    }
-    if version.is_empty() {
-        return Err(invalid("version cannot be empty"));
-    }
-    let (original, mut document) = read(manifest, true)?;
-    let pins = Manifest::parse(original.as_deref().unwrap_or(""))?;
-    if document.contains_key(name) {
-        return Err(invalid(format!("`[{name}]` already exists; use bump")));
-    }
-    let mut dep = Dep::new(name, version, "", "");
-    let raw_url;
-    match (&selection.url, &selection.git) {
-        (Some(url), None) => {
-            if selection.reference.is_some() {
-                return Err(invalid("--ref requires --git"));
-            }
-            raw_url = url.clone();
-            dep.file = selection.file.clone();
-        }
-        (None, Some(repository)) => {
-            if selection.file.is_some() {
-                return Err(invalid("--file applies only to archive sources"));
-            }
-            let revision = resolver.resolve_ref(
-                repository,
-                selection.reference.as_deref().unwrap_or(version),
-            )?;
-            crate::dep::validate_revision(&revision)?;
-            dep.git = Some(GitSource {
-                repository: repository.clone(),
-                revision,
-            });
-            raw_url = String::new();
-        }
-        _ => return Err(invalid("add requires exactly one of --url or --git")),
-    }
-    let mut table = Table::new();
-    if !markers.is_empty() {
-        let mut array = Array::new();
-        markers
-            .iter()
-            .for_each(|marker| array.push(marker.as_str()));
-        table["markers"] = value(array);
-    }
-    document[name] = Item::Table(table);
-    finish(manifest, original, document, &pins, dep, raw_url, resolver)
-}
-
-/// Add an archive pin with an atomically persisted checksum.
-pub fn add(
-    manifest: &Path,
-    name: &str,
-    version: &str,
-    url: &str,
-    markers: &[String],
-    file: Option<&str>,
-) -> Result<String> {
-    let plan = plan_add(
-        manifest,
-        name,
-        version,
-        &Selection {
-            url: Some(url.into()),
-            file: file.map(str::to_owned),
-            ..Selection::default()
-        },
-        markers,
-        &mut Online::default(),
-    )?;
-    let checksum = plan.changes()[0].sha256.clone().expect("archive checksum");
-    plan.apply()?;
-    Ok(checksum)
-}
-
-/// Bump a root and its declared dependencies atomically.
-/// Returns the root archive checksum or resolved Git commit ID.
-pub fn bump(manifest: &Path, name: &str, version: &str, url: Option<&str>) -> Result<String> {
-    let plan = plan_bump(
-        manifest,
-        name,
-        version,
-        &Selection {
-            url: url.map(str::to_owned),
-            ..Selection::default()
-        },
-        &mut Online::default(),
-    )?;
-    let checksum = plan
-        .changes()
-        .iter()
-        .find(|change| change.name == name)
-        .and_then(|change| {
-            change
-                .sha256
-                .clone()
-                .or_else(|| change.git.as_ref().map(|git| git.revision.clone()))
-        })
-        .ok_or_else(|| invalid("updated source has no immutable identity"))?;
-    plan.apply()?;
-    Ok(checksum)
+    SourcePins::parse(&document.to_string())?;
+    Ok(ResolvedSources { document, changes })
 }
 
 /// Verify every archive checksum and exact Git commit's source markers.
 pub fn verify(manifest: &Path) -> Result<Vec<(String, Result<()>)>> {
-    let pins = Manifest::load(manifest)?;
+    let pins = crate::project::Project::load(manifest)?.locked()?;
     let mut results = Vec::new();
-    for dep in pins.iter() {
+    for (id, dep) in &pins.sources {
         let outcome = if dep.git.is_some() {
             crate::Cache::discover()?.source(dep).map(|_| ())
         } else {
@@ -812,7 +600,7 @@ pub fn verify(manifest: &Path) -> Result<Vec<(String, Result<()>)>> {
                 }
             })
         };
-        results.push((dep.name.clone(), outcome));
+        results.push((id.clone(), outcome));
     }
     Ok(results)
 }

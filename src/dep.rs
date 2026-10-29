@@ -21,13 +21,13 @@ pub(crate) fn validate_revision(revision: &str) -> crate::Result<()> {
 #[cfg_attr(feature = "manifest", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dep {
     /// Identifier used for cache paths and messages. Filled in from the table
-    /// name when loaded via [`Manifest`].
+    /// name when loaded through a project lock.
     #[cfg_attr(feature = "manifest", serde(skip))]
     pub name: String,
     /// Exact upstream version.
     pub version: String,
     /// Fixed download URL. `{version}` and `{name}` are substituted when the
-    /// dependency is loaded from a [`Manifest`], so a version bump is a single
+    /// dependency is resolved from project declarations, so a version bump is a single
     /// edit.
     #[cfg_attr(feature = "manifest", serde(default))]
     pub url: String,
@@ -141,7 +141,7 @@ impl Dep {
             identity.update(git.revision.as_bytes());
             return format!("{}-git-{:x}", self.name, identity.finalize());
         }
-        format!("{}-{}", self.name, self.version)
+        format!("archive-{}", self.sha256.to_ascii_lowercase())
     }
 }
 
@@ -312,59 +312,16 @@ impl Dep {
     }
 }
 
-/// A set of pinned dependencies loaded from a TOML manifest.
-///
-/// The file holds one table per dependency, keyed by name:
-///
-/// ```toml
-/// [geos]
-/// version = "3.14.1"
-/// url = "https://download.osgeo.org/geos/geos-3.14.1.tar.bz2"
-/// sha256 = "3c20919cda9a505db07b5216baa980bacdaa0702da715b43f176fb07eff7e716"
-/// markers = ["CMakeLists.txt", "capi/geos_c.h.in"]
-/// ```
+/// Internal validation of normalized immutable source records.
 #[cfg(feature = "manifest")]
 #[derive(Clone, Debug)]
-pub struct Manifest {
+pub(crate) struct SourcePins {
     deps: std::collections::BTreeMap<String, Dep>,
 }
 
 #[cfg(feature = "manifest")]
-impl Manifest {
-    /// Load a manifest from an explicit path.
-    pub fn load(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
-        let path = path.as_ref();
-        if path.file_name().is_some_and(|name| name == "woodshed.toml") {
-            return crate::project::Project::load(path)?.locked_sources();
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| crate::Error::io(format!("cannot read {}", path.display()), error))?;
-        let document: toml::Value =
-            toml::from_str(&text).map_err(|error| crate::Error::Manifest {
-                detail: error.to_string(),
-            })?;
-        if document.get("dependencies").is_some() {
-            return crate::project::Project::parse(path, &text)?.locked_sources();
-        }
-        Self::parse(&text)
-    }
-
-    /// Load root/native `woodshed.toml` plus its lock, falling back to legacy
-    /// `native/versions.toml` only when no declaration file exists.
-    /// That is the conventional location; [`Manifest::load`] accepts any path.
-    pub fn load_default(manifest_dir: impl AsRef<std::path::Path>) -> crate::Result<Self> {
-        let root = manifest_dir.as_ref().join("woodshed.toml");
-        if root.is_file() {
-            return Self::load(root);
-        }
-        let declaration = manifest_dir.as_ref().join("native").join("woodshed.toml");
-        if declaration.is_file() {
-            return Self::load(declaration);
-        }
-        Self::load(manifest_dir.as_ref().join("native").join("versions.toml"))
-    }
-
-    /// Parse manifest text.
+impl SourcePins {
+    /// Validate the normalized source records used by lock resolution.
     pub fn parse(text: &str) -> crate::Result<Self> {
         let tables: std::collections::BTreeMap<String, Dep> =
             toml::from_str(text).map_err(|error| crate::Error::Manifest {
@@ -423,6 +380,7 @@ impl Manifest {
     }
 
     /// Look up a dependency by name.
+    #[cfg(any(feature = "pin", test))]
     pub fn get(&self, name: &str) -> crate::Result<&Dep> {
         self.deps.get(name).ok_or_else(|| crate::Error::Manifest {
             detail: format!("no `[{name}]` section"),
@@ -469,7 +427,7 @@ mod tests {
     #[cfg(feature = "manifest")]
     #[test]
     fn manifest_expands_url_templates() {
-        let manifest = Manifest::parse(
+        let manifest = SourcePins::parse(
             "[geos]\nversion = \"3.15.0\"\nurl = \"https://x.org/{name}/{name}-{version}.tar.bz2\"\n\
              sha256 = \"ab\"\nfile = \"{name}-{version}.tar.bz2\"\n",
         )
@@ -480,8 +438,16 @@ mod tests {
     }
 
     #[test]
-    fn source_dir_name_pairs_name_and_version() {
-        assert_eq!(dep().source_dir_name(), "geos-3.14.1");
+    fn archive_source_identity_uses_content_not_release_labels() {
+        let original = dep();
+        assert_eq!(original.source_dir_name(), "archive-ab");
+        let mut changed = original.clone();
+        changed.version = "different".into();
+        changed.name = "alias".into();
+        changed.sha256 = "AB".into();
+        assert_eq!(original.source_dir_name(), changed.source_dir_name());
+        changed.sha256 = "cd".into();
+        assert_ne!(original.source_dir_name(), changed.source_dir_name());
     }
 
     #[test]

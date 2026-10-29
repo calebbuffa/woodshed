@@ -33,4 +33,4 @@ mod implementation;
 #[cfg(feature = "build")]
 pub(crate) use implementation::discover;
 #[cfg(feature = "package-providers")]
-pub use implementation::{InstallOptions, Installation, install};
+pub use implementation::{InstallOptions, Installation, InstallationOwnership, install};

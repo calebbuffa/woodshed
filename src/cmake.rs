@@ -19,6 +19,7 @@
 
 use crate::{Result, Toolchain};
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,12 +41,15 @@ pub enum MsvcRuntime {
     /// that. Freeing a pointer on the wrong heap corrupts memory in ways that
     /// surface far from the cause.
     AlwaysDynamic,
+    /// Always link the static MSVC runtime; allocation ownership must be compatible.
+    AlwaysStatic,
 }
 
 impl MsvcRuntime {
-    fn cmake_value(self) -> &'static str {
+    pub(crate) fn cmake_value(self) -> &'static str {
         match self {
             Self::MatchRust if crate::crt_static() => "MultiThreaded",
+            Self::AlwaysStatic => "MultiThreaded",
             Self::MatchRust | Self::AlwaysDynamic => "MultiThreadedDLL",
         }
     }
@@ -67,9 +71,11 @@ pub struct CmakeBuild {
     toolchain: Toolchain,
     runtime: MsvcRuntime,
     build_type: String,
-    launcher_define: String,
+    launcher_define: Option<String>,
     target: Option<String>,
     args: Vec<String>,
+    target_triple: Option<String>,
+    environment: Vec<(OsString, OsString)>,
 }
 
 impl CmakeBuild {
@@ -82,9 +88,11 @@ impl CmakeBuild {
             toolchain: Toolchain::detect(),
             runtime: MsvcRuntime::default(),
             build_type: "Release".into(),
-            launcher_define: "CMAKE_CXX_COMPILER_LAUNCHER".into(),
+            launcher_define: None,
             target: Some("install".into()),
             args: Vec::new(),
+            target_triple: None,
+            environment: Vec::new(),
         }
     }
 
@@ -126,13 +134,25 @@ impl CmakeBuild {
         self
     }
 
+    /// Select an explicit build triple for compiler/runtime and rpath policy.
+    ///
+    /// This does not select compilers or cross-compile by itself; cross builds
+    /// still require a matching CMake toolchain file.
+    #[must_use]
+    pub fn target_triple(mut self, triple: impl Into<String>) -> Self {
+        self.target_triple = Some(triple.into());
+        self
+    }
+
     /// Name the cache variable used for the compiler launcher.
     ///
-    /// Defaults to `CMAKE_CXX_COMPILER_LAUNCHER`; a C project wants
-    /// `CMAKE_C_COMPILER_LAUNCHER`.
+    /// By default both `CMAKE_C_COMPILER_LAUNCHER` and
+    /// `CMAKE_CXX_COMPILER_LAUNCHER` are set. Calling this replaces that
+    /// default with only the specified variable, including project-specific
+    /// launcher variables.
     #[must_use]
     pub fn compiler_launcher_define(mut self, define: impl Into<String>) -> Self {
-        self.launcher_define = define.into();
+        self.launcher_define = Some(define.into());
         self
     }
 
@@ -150,7 +170,23 @@ impl CmakeBuild {
     #[must_use]
     pub fn linkage(self, linkage: crate::Linkage) -> Self {
         let build = self.define("BUILD_SHARED_LIBS", linkage.build_shared_libs());
-        match linkage.install_rpath(&crate::target_os()) {
+        let os = build
+            .target_triple
+            .as_ref()
+            .map(|triple| {
+                if triple.contains("windows") {
+                    "windows"
+                } else if triple.contains("apple") {
+                    "macos"
+                } else if triple.contains("linux") {
+                    "linux"
+                } else {
+                    ""
+                }
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(crate::target_os);
+        match linkage.install_rpath(&os) {
             Some(rpath) => build.define("CMAKE_INSTALL_RPATH", rpath),
             None => build,
         }
@@ -171,6 +207,13 @@ impl CmakeBuild {
         self
     }
 
+    /// Set an environment variable for both configure and build child processes.
+    #[must_use]
+    pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
+    }
+
     /// Configure the project without compiling or installing native targets.
     ///
     /// Useful for inspecting generated headers, CMake cache values, and File API
@@ -185,6 +228,7 @@ impl CmakeBuild {
             .reset_build_dir_if_stale(&self.build, &self.source);
 
         let mut configure = Command::new("cmake");
+        configure.envs(self.environment.iter().map(|(name, value)| (name, value)));
         configure
             .arg("-S")
             .arg(&self.source)
@@ -193,7 +237,10 @@ impl CmakeBuild {
             .arg(format!("-DCMAKE_INSTALL_PREFIX={}", self.prefix.display()))
             .arg(format!("-DCMAKE_BUILD_TYPE={}", self.build_type));
 
-        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        if self.target_triple.as_ref().map_or_else(
+            || env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc"),
+            |triple| triple.ends_with("-msvc"),
+        ) {
             configure.arg(format!(
                 "-DCMAKE_MSVC_RUNTIME_LIBRARY={}",
                 self.runtime.cmake_value()
@@ -201,8 +248,10 @@ impl CmakeBuild {
         }
 
         configure.args(&self.args);
-        self.toolchain
-            .apply_to_configure(&mut configure, &self.launcher_define);
+        match &self.launcher_define {
+            Some(define) => self.toolchain.apply_to_configure(&mut configure, define),
+            None => self.toolchain.apply_to_configure_default(&mut configure),
+        }
         crate::process::check(&mut configure, "cmake configure")?;
 
         Ok(ConfiguredCmakeBuild {
@@ -211,12 +260,69 @@ impl CmakeBuild {
             build_type: self.build_type,
             target: self.target,
             toolchain: self.toolchain,
+            environment: self.environment,
         })
     }
 
     /// Configure, build, and install. Returns the install prefix.
     pub fn install(self) -> Result<PathBuf> {
         self.configure()?.build()
+    }
+
+    /// Configure for the final prefix, then build and install into a private stage.
+    ///
+    /// The caller owns staging, publication and locks. This uses `--prefix`,
+    /// not DESTDIR, so it also works on Windows. The configured final prefix
+    /// remains available to upstream generated headers/configuration files.
+    pub fn install_staged(self, stage: &std::path::Path) -> Result<PathBuf> {
+        let configured = self.target(None::<String>).configure()?;
+        let mut build = Command::new("cmake");
+        build.envs(
+            configured
+                .environment
+                .iter()
+                .map(|(name, value)| (name, value)),
+        );
+        build
+            .arg("--build")
+            .arg(&configured.build)
+            .arg("--config")
+            .arg(&configured.build_type);
+        configured.toolchain.apply_to_build(&mut build);
+        crate::process::check(&mut build, "cmake build")?;
+        let mut install = Command::new("cmake");
+        install.envs(
+            configured
+                .environment
+                .iter()
+                .map(|(name, value)| (name, value)),
+        );
+        install
+            .arg("--install")
+            .arg(&configured.build)
+            .arg("--config")
+            .arg(&configured.build_type)
+            .arg("--prefix")
+            .arg(stage);
+        crate::process::check(&mut install, "cmake staged install")?;
+        let manifest = std::fs::read_to_string(configured.build.join("install_manifest.txt"))
+            .map_err(|error| crate::Error::io("read CMake installation manifest", error))?;
+        let stage = stage
+            .canonicalize()
+            .map_err(|error| crate::Error::io("resolve staged installation", error))?;
+        for file in manifest.lines() {
+            let path = std::path::Path::new(file).canonicalize().map_err(|error| {
+                crate::Error::io(format!("resolve installed file {file}"), error)
+            })?;
+            if !path.starts_with(&stage) {
+                return Err(crate::Error::Incomplete {
+                    detail: format!(
+                        "CMake installed outside its private staging prefix: {file}; absolute install destinations are not supported"
+                    ),
+                });
+            }
+        }
+        Ok(configured.prefix)
     }
 
     /// The install prefix this build will produce.
@@ -235,6 +341,7 @@ pub struct ConfiguredCmakeBuild {
     build_type: String,
     target: Option<String>,
     toolchain: Toolchain,
+    environment: Vec<(OsString, OsString)>,
 }
 
 impl ConfiguredCmakeBuild {
@@ -255,6 +362,7 @@ impl ConfiguredCmakeBuild {
     /// installation occurs; callers must still check their required artifacts.
     pub fn build(self) -> Result<PathBuf> {
         let mut build = Command::new("cmake");
+        build.envs(self.environment.iter().map(|(name, value)| (name, value)));
         build
             .arg("--build")
             .arg(&self.build)
@@ -274,6 +382,66 @@ impl ConfiguredCmakeBuild {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn configure_uses_default_or_explicit_launcher_variables() {
+        let root = env::temp_dir().join(format!(
+            "woodshed-launchers-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.15)\nproject(launcher_test NONE)\n",
+        )
+        .unwrap();
+        for (index, define) in [
+            None,
+            Some("CMAKE_C_COMPILER_LAUNCHER"),
+            Some("CMAKE_CXX_COMPILER_LAUNCHER"),
+            Some("CUSTOM_LAUNCHER"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dirs = crate::BuildDirs {
+                build: root.join(format!("build-{index}")),
+                prefix: root.join("prefix"),
+            };
+            let toolchain = Toolchain::detect();
+            let mut expected = Command::new("cmake");
+            match define {
+                Some(define) => toolchain.apply_to_configure(&mut expected, define),
+                None => toolchain.apply_to_configure_default(&mut expected),
+            }
+            let mut build = CmakeBuild::new(&source, &dirs).toolchain(toolchain);
+            if let Some(define) = define {
+                build = build.compiler_launcher_define(define);
+            }
+            let _guard = dirs.lock().unwrap();
+            build.configure().unwrap();
+            let cache = std::fs::read_to_string(dirs.build.join("CMakeCache.txt")).unwrap();
+            for name in [
+                "CMAKE_C_COMPILER_LAUNCHER",
+                "CMAKE_CXX_COMPILER_LAUNCHER",
+                "CUSTOM_LAUNCHER",
+            ] {
+                let expected_value = expected
+                    .get_args()
+                    .find_map(|arg| arg.to_str()?.strip_prefix(&format!("-D{name}=")));
+                let actual = cache
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}:UNINITIALIZED=")));
+                assert_eq!(actual, expected_value, "{name}, override {define:?}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn configure_exposes_metadata_without_building_targets() {

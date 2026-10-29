@@ -29,7 +29,7 @@ Run commands in the application's directory.
 Install the maintenance CLI once:
 
 ```text
-cargo install woodshed --version 0.3.0 --features cli,git
+cargo install woodshed --version 0.3.1 --features cli
 ```
 
 Then add fmt and select its documented CMake export:
@@ -115,7 +115,7 @@ Other targets need a matching triplet; do not copy `x64-windows` for Linux.
 Install the CLI with the provider enabled, then add the package:
 
 ```text
-cargo install woodshed --version 0.3.0 --features cli,git,vcpkg
+cargo install woodshed --version 0.3.1 --features cli,vcpkg
 woodshed add zstd --version 1.5.7 --provider vcpkg --triplet x64-windows --cmake-package zstd --target zstd::libzstd_shared --dynamic
 ```
 
@@ -193,7 +193,7 @@ cmake = { package = "ZLIB", targets = ["ZLIB::ZLIB"], linkage = "static" }
 Lock the declaration using the provider-enabled CLI:
 
 ```text
-cargo install woodshed --version 0.3.0 --features cli,conan
+cargo install woodshed --version 0.3.1 --features cli,conan
 woodshed lock
 ```
 
@@ -256,20 +256,32 @@ linkage = "static"
 defines = { EXAMPLE_BUILD_TESTS = "OFF" }
 toolchain = "toolchains/target.cmake"
 inputs = ["toolchains/sdk-settings.cmake"]
+env = ["EXAMPLE_SDK_MODE"]
 ```
 
 `toolchain` and `inputs` are optional paths relative to `woodshed.toml`. Cross
 builds require an explicit toolchain. List any extra files read by your toolchain
 or project options in `inputs`: Woodshed hashes those bytes and tells Cargo when
-to rerun. It cannot infer arbitrary files read by upstream CMake.
+to rerun. List additional inherited, output-affecting environment variables in
+`env`; they are tracked, not assigned. Standard compiler/linker flags, search paths,
+SDK environment and `SOURCE_DATE_EPOCH` are already tracked. Woodshed cannot infer
+arbitrary files or environment reads inside upstream CMake.
 `CMAKE_*` and `BUILD_SHARED_LIBS` overrides are rejected in `defines`; use the
 dedicated toolchain/linkage fields, or the low-level Rust API for custom policies.
+Source recipes disable CMake package registries and standard FetchContent network
+population/updates. Projects requiring vendored sources must supply them or use
+upstream options for installed dependencies; Woodshed is not a network sandbox for
+arbitrary build scripts.
 
 The build key includes source identity, recipe, target, CRT, declared input bytes,
-tracked compiler/SDK environment, and discovered build-tool paths/timestamps.
-A successful installation records all installed file paths/sizes and evaluated
-export metadata; missing or size-changed files trigger rebuilding. This is a
-completeness check, not a cryptographic integrity audit of locally built output.
+tracked compiler/SDK environment, and the bytes of selected compiler, linker,
+generator and launcher executables. MSVC target recipes default to Rust's CRT;
+host tools default to the dynamic CRT independently of Rust's target. An explicit
+`msvc-runtime = "static"` or `"dynamic"` overrides that choice, independently of
+library `linkage`; allocation ownership across CRT boundaries remains your responsibility.
+A successful source installation records full tree and metadata hashes;
+missing/changed files trigger repair, including same-size, same-mtime changes.
+This detects local corruption, not untrusted-build provenance.
 Changing options requires a matching regenerated lock, even when source pins
 are unchanged.
 
@@ -281,6 +293,411 @@ guessing how to change them. `--dry-run` previews both files. Each file replacem
 is atomic, but the pair is not: interruption can leave an unconfigured bridge;
 rerun setup to finish. Ordinary manifest-write failures remove a newly created
 bridge. Existing scripts can call `woodshed::build()?` manually.
+
+### Features, targets, local sources, and native dependency graphs
+
+Source builds, vcpkg, and Conan declarations share `optional = true` and
+`role = "host"` (the default role is `"target"`). Source recipes can declare
+`depends = ["other"]` on source or provider packages. Dependency gates are resolved by Woodshed before invoking any
+build system or provider; inactive nodes are not downloaded, installed, or built.
+
+```toml
+[features]
+default = ["fast"]
+fast = ["dep:codec", "engine/simd"]
+
+[dependencies.engine]
+path = "native/engine"
+depends = ["generator"]
+optional-depends = ["codec"]
+default-features = false
+
+[dependencies.engine.build]
+cmake = "Engine"
+targets = ["Engine::Engine"]
+
+[dependencies.engine.build.features.simd]
+ENGINE_ENABLE_SIMD = "ON"
+
+[dependencies.codec]
+github = "example/codec"
+version = "1.0"
+optional = true
+build = { cmake = "Codec", targets = ["Codec::Codec"] }
+
+[dependencies.generator]
+path = "native/generator"
+role = "host"
+optional = true
+build = { tools = ["codegen"] }
+
+[target.'cfg(target_os = "linux")'.dependencies.platform]
+path = "native/linux"
+build = { cmake = "Platform", targets = ["Platform::Platform"] }
+```
+
+`path` is relative to `woodshed.toml`; local sources need no fake version,
+checksum, Git ref, or remote access. Their current file contents (excluding
+`.git`) affect installation identity, and Cargo watches the source directory.
+Keep local source directories separate from generated build/cache outputs.
+Source trees are built out of tree. Changes during compilation fail explicitly
+instead of publishing a receipt under the wrong content identity.
+
+Manifest features expand to other features, `dep:name` dependency gates, or
+`name/native-feature` for a source recipe. Optional dependencies have an implicit
+same-name feature unless mentioned through `dep:name`. Required graph edges
+activate optional prerequisites too. Source recipe `build.features` maps native
+features to upstream project-specific CMake definitions; `build.default-features`
+lists native features enabled by default, while a dependency's `default-features`
+and `features` select them. Feature definitions override base `build.defines`;
+two enabled features requesting different values for the same option are errors.
+No upstream option names or capability sets are inferred.
+
+Use `optional-depends = ["codec"]` for an edge that should exist only when that
+dependency is independently enabled. Unlike `depends`, it does not activate the
+dependency. This combines feature-gated native packages with correct build
+ordering, prefix propagation, and downstream invalidation without handwritten
+consumer CMake glue.
+
+`woodshed setup` adds missing, empty Cargo feature declarations with the same
+names, retaining existing feature definitions. The one-line bridge reads enabled
+matching Cargo features, including Cargo's `default` feature, so `cargo build
+--no-default-features --features fast` controls this graph. If integrating
+manually without a Cargo `default` feature declaration, Woodshed's defaults stay
+enabled. For explicit control use `build_from_with_options(path, &PlanOptions)`.
+Native features of vcpkg ports and Conan options remain explicit in their locked
+provider declarations; manifest feature forwarding into provider-specific native
+features is rejected rather than silently changing the provider's locked graph.
+Provider recipes retain their provider-owned dependency graphs: external
+`depends`/`optional-depends` on a vcpkg/Conan declaration are rejected, not silently
+ignored. A source recipe can consume any selected provider package.
+
+Target tables accept exact Rust triples or Rust `cfg(...)` predicates, evaluated
+against the Rust **target**, not the build host. All remote variants are locked
+by explicit maintenance commands, including optional and inactive variants.
+Multiple matching declarations for one name are errors; use disjoint target
+tables instead of relying on table-order overrides. An active edge to a
+target-inapplicable dependency fails with the dependency name and target.
+The Cargo bridge uses actual `CARGO_CFG_*` values, including target features;
+explicit API callers can supply `PlanOptions::target_cfg`, otherwise cfg values
+come from `rustc --print cfg --target`. Build-profile/crate predicates such as
+`cfg(feature = "...")`, `test`, and `debug_assertions` are rejected: express
+dependency gates in `[features]` instead.
+
+Woodshed schedules prerequisites before dependents and includes prerequisite
+installation identities in downstream keys. Same-role dependency package roots
+populate `CMAKE_PREFIX_PATH`; host tools populate `CMAKE_PROGRAM_PATH` and the
+child-process `PATH`. `build.tools` names executables installed under `bin/`
+without the platform `.exe` suffix. Tool-only sources need no CMake package
+exports. Host nodes build for HOST, never emit target Rust link directives, and
+cannot depend on target nodes. Target cross-builds still require an explicit
+toolchain; no host compiler or provider substitution occurs.
+
+For library builds, select the upstream's installed CMake CONFIG package and
+exported targets in the manifest. Woodshed generates its own metadata consumer;
+users do not need to write consumer CMake glue. An upstream without install rules,
+package exports, or build-system support for a requested option still requires an
+upstream recipe/change or a custom low-level integration. Arbitrary project build
+logic cannot be inferred. vcpkg/Conan retain their own locked build recipes.
+
+Static/shared linkage remains an explicit per-recipe choice. Graph link emission
+deduplicates transitive libraries after dependents and rejects conflicting native
+library files or link kinds. Typed imported targets retain per-file static/shared
+linkage, including mixed dependency graphs and Windows import libraries.
+Unknown imported `.lib` types still require the recipe's explicit linkage contract;
+Woodshed cannot infer their ABI from a filename. Selected shared runtime files are staged under
+Cargo's `OUT_DIR` for `cargo run`/`cargo test`, and exposed to `woodshed bundle`.
+Extra plugins/resources and undeclared operating-system runtime dependencies
+still need explicit deployment declarations; this is not binary-loader closure
+inference.
+
+Inspect selection without downloading or building:
+
+```text
+woodshed tree --target aarch64-unknown-linux-gnu --features fast
+woodshed explain engine --no-default-features --features fast --json
+woodshed add engine --path native/engine --cmake-package Engine --target Engine::Engine
+```
+
+The Rust API exposes `Project::resolve(&PlanOptions) -> ResolvedPlan`, with
+prerequisite-first nodes carrying lock IDs, host/target roles and triples,
+effective native features/defines, original typed declarations, and activation
+reasons. `tree`/`explain` report selection, not cache-hit predictions or ABI proof.
+
+For custom superbuilds, source declarations can omit `build` entirely. Load
+`Project::load(manifest_path)`, validate its adjacent lock with `project.locked()`,
+then call `project.resolve(&options)`. For each selected remote source, use
+`lock.sources[&node.id]` (not the display name) with `Cache::source` and
+`Cache::verify_source`. Local sources instead use the declared `path`, relative
+to the manifest. This selects and acquires sources without invoking the package
+build orchestrator. The caller owns its superbuild/install policy and must
+verify every consumed pinned source, including prepared dependency mounts.
+
+Manifest features may be empty (`cpu = []`) or compose other features
+(`dialect = ["frontend", "dep:dialect-source"]`). Like Cargo, feature activation
+is additive: composition enables prerequisites; listing a dependency in two
+different features does not require both features to be enabled.
+
+After changing only feature gates, graph edges or source build recipes, preserve
+all existing revisions/checksums without remote resolution by supplying the
+previous declarations that match the lock:
+
+```text
+woodshed lock --manifest woodshed.toml --preserve-pins-from previous-woodshed.toml
+```
+
+The equivalent Rust API is `project::plan_relock(manifest_path, previous_text)`,
+returning an `Update` to preview and `apply()`. It validates the old lock and
+rejects changed source selectors, dependency IDs, provider selections or profile
+contents. It never invokes a resolver or downloads sources. Normal `woodshed lock`
+explicitly resolves all declarations; ordinary builds never refresh locks.
+
+### Compatible workspaces and immutable source installations
+
+Source recipes build from a private, content-synchronized source snapshot, without
+`.git` metadata, and publish separate immutable installations. By default, different
+source/configuration inputs get isolated workspaces. A package can explicitly opt
+into in-place source edits and a bounded set of CMake reconfigurations:
+
+```toml
+[dependencies.engine.build.workspace]
+name = "development"
+reconfigure = ["ENGINE_ENABLE_SIMD"]
+dependencies = ["codec"]
+```
+
+The options must be declared in that recipe's `defines` or native `features`;
+dependencies must be explicit `depends`/`optional-depends` edges. `name` is only a
+grouping label: manifest identity, dependency ID, pinned source family/path and
+hard configuration namespace the workspace. Target/role, Release configuration,
+generator, linkage/CRT, declared file bytes, compiler/linker environment, selected
+native tools and host prerequisites remain hard inputs. Tool byte changes reset
+the owned build subtree before object reuse. Unrelated manifests/packages cannot
+share a workspace merely by choosing the same label.
+
+Only listed option values and same-role prerequisite identities may vary within
+that boundary; local source contents may change. This authorizes reconfiguration,
+**not** ABI-compatible artifact reuse. Every selected prerequisite identity,
+feature, effective definition and source content identity always remains in the
+exact artifact key. There is no capability union: a cache miss configures precisely
+the requested state. Removed Woodshed-managed definitions, prefix/program paths
+and evaluated `<Package>_DIR` hints are explicitly unset; unrelated upstream cache
+entries are preserved. An absent native feature removes its override, so upstream
+defaults apply unless the base recipe explicitly supplies an off value.
+
+Workspace and artifact locks cover mutation and publication. Sources are checked
+for edits and build-tree writes before publication. CMake configures against the
+final immutable prefix, installs into a private stage, and that complete snapshot
+is renamed into place. Metadata is evaluated at the final prefix before an atomic
+completion receipt makes it reusable. Installed headers/configuration and evaluated
+include/link/tool paths must not reference the mutable source, workspace, stage or
+metadata probe. Safe internal install symlinks are materialized; escaping links,
+cycles and unsupported file types fail. Existing verified prefixes are never
+overwritten; only owned incomplete/corrupt entries are repaired. Recovery refuses
+nonempty unowned directories and cleans only identity-specific owned staging.
+
+Generated headers belong to each exact installation, not the mutable workspace.
+An exact artifact hit avoids reconfiguration; otherwise CMake decides which
+objects remain reusable. This does not promise object reuse when dependency
+include paths, command lines or headers change. SDK/system dependencies outside
+the declared graph still require correct toolchain/environment/input declarations;
+this is not arbitrary ABI inference, runtime-loader closure or a relocatable
+binary-cache format.
+
+Build diagnostics distinguish isolated workspace creation, compatible
+reconfiguration, tool-boundary resets, verified artifact reuse and corruption
+repair. `artifacts/<full-fingerprint>/woodshed-installation.json` records content
+and metadata fingerprints plus per-input field hashes for comparison. Environment
+values are not copied into those receipts. `Installation.cmake_packages` reports
+evaluated CONFIG directories rather than guessed layouts.
+
+`Installation.ownership` is `Artifact` for these source-recipe snapshots,
+`Provider` for vcpkg/Conan installations, and `External` for low-level discovery.
+**Provider prefixes retain provider-owned cache lifetimes; source immutable-
+publication guarantees do not apply to them.** Woodshed does not copy entire
+provider caches or claim uniform provider artifact publication.
+
+### Understanding rebuilds and managing artifacts
+
+Every successful source build or prebuilt import records its decision in
+`diagnostics/`. Reports compare with the previous **successful request for the
+same manifest/declaration ID**, including requests that selected a different hard
+workspace. They distinguish `built`, `imported`, `repaired` and `reused`, identify
+changed input fields (for example `defines`, `dependencies`, `configured-tools`,
+or `env:CFLAGS`), and show the exact artifact and optional workspace fingerprints.
+They do not predict a future build or claim that CMake will recompile every object.
+
+```text
+woodshed cache-explain codec --manifest woodshed.toml --json
+woodshed cache inspect
+woodshed cache verify FULL_ARTIFACT_FINGERPRINT
+woodshed cache prune FULL_ARTIFACT_FINGERPRINT
+woodshed cache prune FULL_ARTIFACT_FINGERPRINT --apply
+```
+
+`Cache::explain_build(manifest, declaration_id)` returns `BuildExplanation`.
+Only field hashes are persisted; environment values are not copied into reports.
+`Cache::inspect_artifacts()` and `verify_artifact(id)` check complete content and
+metadata without repairing it. Pruning defaults to a preview, requires explicit
+full IDs, refuses unowned trees, and never prunes sources or provider caches.
+It serializes against active high-level builds. Artifacts referenced by Cargo
+output directories remain retained until those directories are removed (for
+example by `cargo clean`); retaining older configurations is intentionally
+conservative. Custom integrations use `pin_artifact(id, name)` /
+`unpin_artifact(name)` (CLI `cache pin` / `cache unpin`) while retaining paths.
+High-level builds without `OUT_DIR` retain a durable `standalone:FULL_ID` pin;
+release that named pin explicitly when the standalone installation is no longer used.
+Do not prune unpinned installations used outside the high-level Cargo bridge.
+Use `Cache::from_environment()` in CLI tools to avoid emitting Cargo directives.
+
+### Sharing native declarations across a Cargo workspace
+
+Put reusable selections in a root `woodshed.toml`:
+
+```toml
+[workspace.dependencies.codec]
+path = "native/codec"
+default-features = false
+build = { cmake = "Codec", targets = ["Codec::Codec"], features = { simd = { SIMD = "ON" } } }
+```
+
+Then inherit them from member `woodshed.toml` files:
+
+```toml
+[dependencies.codec]
+workspace = true
+optional = true
+features = ["simd"]
+```
+
+The nearest ancestor `woodshed.toml` containing `[workspace]` is the inheritance
+boundary; a root manifest can inherit its own entries too. Target-specific tables
+can also inherit. Source, recipe-input, toolchain and Conan-profile paths remain
+relative to the root declaration, not the member. Member overrides are restricted
+to `optional`, additive `features`, and `default-features`; disabling defaults
+requires the root to declare `default-features = false`, as in Cargo.
+Other source/build policy changes must be made explicitly at the root.
+
+Resolution and each member's lock contain the effective declaration. Root changes
+invalidate affected member locks, and the Cargo bridge watches inherited manifests.
+Updates preserve `workspace = true` rather than silently flattening member intent;
+concurrent root edits are rejected. Edit a shared selection at its root and relock
+members rather than using a member bump to detach it. Feature selection remains
+per member's resolved native graph; this does not merge unrelated Cargo invocations
+or infer ABI compatibility across different package requests.
+
+### Toolchain doctor
+
+```text
+woodshed doctor
+woodshed doctor --target aarch64-unknown-linux-gnu --toolchain cross.cmake --json
+```
+
+`doctor(&DoctorOptions)` configures and compiles a fresh C library and links it
+into a C++ executable using Woodshed's normal generator/launcher selection. It
+reports the actual C/C++ compilers, linker, generator and launchers, captured
+diagnostics and actionable failure guidance. It never runs the executable,
+installs tools, changes a native cache, or substitutes a host compiler for an
+explicit cross target. Cross checks require a toolchain file. Reports may contain
+native-tool paths/output: review them before sharing.
+
+### Live progress and build decisions
+
+Woodshed reports phase starts/ends, elapsed time, lock waits, source/archive cache
+verification, and native command exit status to stderr. Long phases emit a
+heartbeat every ten seconds, including while a compiler or verification is busy.
+Dependency graph builds report their position and emit installation reuse,
+build/import and repair decisions. Before rebuilding, changed identity field names
+explain why (for example `defines`, `dependencies`, or `env:CFLAGS`); raw environment
+values are not printed. These are Woodshed decisions, not guesses about which
+individual compiler objects Ninja will rebuild.
+
+Cargo captures build-script stderr: use `cargo build -vv` to expose it. For
+reliable live observation without relying on Cargo's display, set an explicit log:
+
+```powershell
+$env:WOODSHED_LOG = "$PWD\native-build.log"
+cargo build
+# In another terminal:
+Get-Content .\native-build.log -Wait -Tail 30
+```
+
+`WOODSHED_LOG` appends timestamped, process-labelled progress records immediately;
+its parent directory must exist. Processes sharing the log serialize complete
+records. `WOODSHED_PROGRESS=0` disables progress on stderr without disabling the
+log. Logging failures print an explicit diagnostic to stderr; they do not turn an
+otherwise valid build into a failure. The log contains Woodshed events, not the
+complete child-process output; capture `cargo build -vv 2>&1 | Tee-Object build.log`
+for compiler diagnostics too. Phase `ended` is a duration marker, not a success
+claim; command exit records and the build result determine success.
+
+Custom consumers can call `woodshed::progress::report("message") -> io::Result<()>`
+to use the same sinks. Consumer-specific superbuild/cache policy must report its
+own decisions; Woodshed cannot infer them. No terminal percentages are invented
+for operations whose total work is unknown.
+
+### Verified prebuilts and local portable packages
+
+Source installations are not automatically portable. Explicitly export a verified
+artifact with `Cache::export_artifact(id, destination, &ArtifactMetadata, toolchain)`
+or `woodshed cache export ID --output package --metadata metadata.json`.
+`ArtifactMetadata` contains `compatibility`, optional `cmake` package/targets,
+and installed `tools`. Compatibility must specify an exact Rust target, a
+publisher-defined nonempty `abi` contract, `configuration = "Release"`, linkage,
+and an MSVC runtime exactly for MSVC targets. The ABI label is an explicit
+publisher/consumer agreement, **not inferred compiler compatibility or proof of ABI**.
+
+Export verifies the original target/configuration/linkage/CRT receipt, scans all
+files for embedded old-prefix references (including UTF-16), and evaluates the
+installed exports at a different prefix. External installation references fail:
+the initial portable format is deliberately self-contained, not a way to export
+an arbitrary dependent artifact graph. Cross-target metadata evaluation requires
+an explicit toolchain. Generated headers/configs and binaries must support
+relocation; Woodshed does not rewrite binaries or CMake files to hide bad exports.
+
+Export atomically creates a new package directory containing `prefix/` and
+`woodshed-artifact.json`. Its versioned descriptor records compatibility, export
+intent, every directory and file hash, and executable modes, using UTF-8 paths
+with platform-independent separators. Unix imports check executable modes;
+Windows verifies content and entry types because it cannot represent Unix mode
+bits. Read/write permissions and other host-specific metadata are not portable
+package identity. Metadata evaluation must not modify the exported installation.
+Safe installation links have already been materialized in source snapshots.
+Existing export destinations are never overwritten.
+
+Consume a local exported package without compiling its source:
+
+```toml
+[dependencies.codec]
+path = "packages/codec"
+prebuilt = { target = "x86_64-pc-windows-msvc", abi = "publisher-c-api-v1", configuration = "Release", linkage = "static", msvc-runtime = "dynamic" }
+```
+
+For distribution, archive the complete package **as one top-level directory**,
+preserving executable permissions. Replace `path` with explicit `url` / `version`
+fields and generate a lock; its archive checksum protects the published bytes.
+Do not infer target/ABI from the archive filename. The embedded compatibility
+must exactly match the manifest, the complete inventory must verify, and metadata
+is re-evaluated at the final immutable imported prefix. There is no silent source
+fallback, source reconfiguration, or network refresh during an ordinary build.
+Selected native features require a different explicit prebuilt selection.
+
+A cross-target package with CMake exports can supply a `build` metadata recipe
+with matching package/targets/linkage and explicit `toolchain`; it cannot contain
+source reconfiguration options. Tool-only packages declare their installed `bin`
+names in the descriptor. Imported installations use the same content-verified,
+locked source-artifact publication and retention protections as compiled recipes.
+Integrity verifies selected bytes, not publisher trust; imported CMake exports,
+like source recipes, are trusted build code. Dynamic system-loader compatibility
+remains part of the explicit ABI/platform contract.
+
+CI runs the real C/C++ graph, static/shared linking, artifact, source and recovery
+fixtures on Windows, Linux and macOS, with a Rust 1.89 check. A configured CI matrix
+is not evidence that an unexecuted platform has passed on this machine.
+
+**Still outside this implementation:** immutable publication for provider-owned
+prefixes and native remote binary-cache storage/services. No provider cache
+copying or implicit remote service is introduced.
 
 The rest of this guide is reference material. Start here only when the recipes
 above do not cover your integration:
@@ -299,7 +716,7 @@ ignores `CmakeBuild`; one that only wants to find an existing install takes
 
 | Feature                              | Gives you                                                                                             |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `manifest`                           | Human `woodshed.toml` declarations, generated `woodshed.lock`, and legacy pins                        |
+| `manifest`                           | Human `woodshed.toml` declarations and generated `woodshed.lock`                                      |
 | `download`                           | HTTPS fetching, with a system `curl` fallback for corporate proxies                                   |
 | `git`                                | Immutable Git snapshots and submodule/file metadata using the host Git executable                     |
 | `tar-gz`, `tar-bz2`, `tar-xz`, `zip` | Archive extraction, one format each                                                                   |
@@ -349,10 +766,74 @@ guess dependency versions or fetch unpinned upstream dependencies.
 canonicalize source directories and recognize Windows verbatim/UNC spellings
 without discarding Unix path case sensitivity.
 
+Detected sccache/ccache launchers now apply to **both C and C++** by default.
+`CmakeBuild::compiler_launcher_define("CMAKE_C_COMPILER_LAUNCHER")` selects
+only C; passing `CMAKE_CXX_COMPILER_LAUNCHER` selects only C++, and a custom
+variable selects only that variable. At the lower level,
+`Toolchain::apply_to_configure_default` configures both languages while
+`apply_to_configure(command, variable)` retains its single-variable behavior.
+No launcher flags are emitted when no compiler cache is detected.
+
+### Stable mirrors and additive source workspaces
+
+`Cache::mirror(source, key)` synchronizes the existing `mirrors/<key>` path
+by file content instead of deleting and recopying it. Unchanged files retain
+their timestamps even if input timestamps change. Removed files/directories
+and file/directory transitions are reflected in the mirror.
+`Cache::mirror_to(source, destination)` applies the same operation to an existing
+or caller-chosen path. The destination must be exclusively owned: entries not
+in the source are deleted. Source symlinks are materialized as before; destination
+links are replaced without writing through them. Cyclic directory links and
+overlapping source/destination roots are rejected.
+
+`Cache::prepare(key, source, mounts)` still describes an immutable set of inputs:
+changing the source or mounts under a completed key is an error. For writable
+source trees that acquire optional pinned dependencies lazily, use:
+
+```rust,ignore
+let key = woodshed::BuildKey::new("pinned-source-family").dep(&upstream);
+let source = cache.source(&upstream)?;
+let prepared = cache.prepare_incremental(&key, &source, &[])?;
+// Later, possibly from a different build configuration:
+let prepared = cache.prepare_incremental(
+    &key, &source, &[(std::path::PathBuf::from("third_party/library"), dependency)],
+)?;
+```
+
+The root remains at `prepared/<key>`; new mounts do not change its absolute
+path or recopy patched root files. Omitted mounts remain installed.
+`Cache::prepare_incremental_to(source, destination, mounts)` instead adopts
+an existing directory **without recopying it**, or copies the source if the
+destination does not exist. This lets callers add dependencies to existing trees
+without changing CMake's stored source path.
+
+Both APIs record canonical source and dependency paths as pinned identities.
+Callers must keep those input paths immutable and mix the pinned root identity
+into the key; Woodshed does not hash entire dependency trees. Dependencies
+use Unix symlinks or Windows junctions and must not be modified by builds.
+Different recorded identities, duplicate/overlapping/escaping mount paths,
+linked mount ancestors, and conflicting links/files/nonempty directories
+fail explicitly. Empty submodule placeholders can become mounts.
+Identity state lives in a sibling `<destination>.incremental` directory; keep
+it with the root. State updates are atomic, interrupted copies are retried,
+and missing recorded mounts are restored on reuse.
+
+Mirror refreshes and prepared-source operations have sibling interprocess
+locks. Callers must still hold their build/workspace locks while builds read
+these shared trees; the source operation lock covers synchronization, not the
+whole native build.
+
+Returned mirror and incremental prepared-source paths preserve the caller's
+absolute destination spelling (relative destinations are made absolute).
+Canonicalization is internal to identity, locking, and safety checks: it does
+not resolve parent-directory aliases or add Windows `\\?\` prefixes to returned
+build-facing paths. This keeps CMake source paths and compiler command lines
+stable; callers supplying verbatim paths explicitly retain that spelling.
+
 ### Maintaining dependencies
 
 ```text
-cargo install woodshed --features cli,git
+cargo install woodshed --features cli
 woodshed add geos --version 3.14.1 --url "https://download.osgeo.org/geos/{name}-{version}.tar.bz2"
 woodshed bump geos 3.15.0     # rewrites version, re-downloads, updates sha256
 woodshed verify               # re-hash every pin
@@ -369,7 +850,7 @@ new expected checksum; `build.rs` never does. Provisioning still checks archive 
 `add` and `bump` share one transactional planner. A bump resolves the selected
 source and all transitively declared dependent sources, then computes archive
 checksums. Nothing is written until the entire plan succeeds. `--dry-run`
-prints declarations and lock (JSON changes for legacy pins) without writing. Comments, markers,
+prints declarations and lock without writing. Comments, markers,
 resolution policies, and unrelated entries are preserved. The result is
 staged beside the manifest. Each file replacement is atomic, including on Windows.
 There is no two-file atomic rename: a process interruption between replacements
@@ -417,64 +898,55 @@ revision are not evaluated. For unusual nonliteral formats, `pattern` remains
 an advanced escape hatch with exactly one capturing group. Choose exactly one
 of `cmake-variable`, `cmake-url`, or `pattern` per file selector.
 
-#### Legacy source-manifest examples
-
-The following examples describe the compatible combined `versions.toml` format
-and the immutable records stored in generated locks. In new declarations,
-selection goes under `[dependencies.NAME]`; parent-managed children only need
-markers and `resolve`, not independent versions, source URLs, or checksums.
-
 #### Git sources and release archives
 
 `--git` selects a repository rather than a published source archive.
-`--ref` can select a tag, branch, or commit, but the manifest always records
-the resolved full commit ID. Builds never resolve moving refs:
+`--ref` can select a tag, branch, or commit. Declarations retain selection intent;
+the generated lock records the resolved full commit ID. Builds never resolve moving refs:
 
 ```toml
-[example]
+[dependencies.example]
 version = "1.2.0"
+git = "https://example.org/example.git"
+tag = "v1.2.0"
 markers = ["CMakeLists.txt"]
-[example.git]
-repository = "https://example.org/example.git"
-revision = "0123456789abcdef0123456789abcdef01234567"
 ```
 
 `Cache::source` exports tracked files without `.git`, checkout hooks/filters, or
 automatic submodule initialization. Cache and build identities include the
 repository and immutable commit. Completed snapshots work offline; missing or
 incomplete snapshots fail explicitly. Enable `git` in the consuming build
-dependency only when it needs Git sources. Existing archive cache identities
-are unchanged.
+dependency only when it needs Git sources. Extracted archives live under `sources/archive-<sha256>`,
+so different locked bytes never share a tree just because name/version labels
+match. No previous directories are scanned or adopted. Completed Git and archive
+trees have full content/type/permission fingerprints; modifying cached inputs is
+not supported. Copy writable inputs with `Cache::prepare` or
+`Cache::prepare_incremental` instead. Archive extraction is staged, verified and
+recorded under a lock; missing/modified content is restored from a verified cached
+archive, including offline. A valid extracted tree can be reused without keeping
+its downloaded archive. A damaged Git snapshot requires repopulating its exact
+commit with network/repository access; ordinary builds never resolve moving refs.
 
-An archive can also record its Git provenance for dependency discovery:
+GitHub source archives retain Git provenance in the generated lock for dependency discovery:
 
 ```toml
-[parent]
+[dependencies.parent]
+github = "example/parent"
 version = "1.2.0"
-url = "https://example.org/parent/archive/{revision}.tar.gz"
-sha256 = "<64 hexadecimal characters>"
 file = "parent-{version}.tar.gz"
-[parent.upstream]
-repository = "https://example.org/parent.git"
-revision = "0123456789abcdef0123456789abcdef01234567"
-reference = "v{version}"
 ```
 
 `woodshed bump parent 1.3.0` resolves `v1.3.0` once, updates the immutable
 revision and archive checksum, and updates any declared dependents. `--ref`
-overrides the ref for that operation. `{revision}` in archive URLs uses the
-recorded upstream commit, not the human release label.
+overrides the ref for that operation. Locked archives use the resolved upstream
+commit, not the human release label.
 
 #### Dependent sources
 
 Declare relationships once in the manifest rather than scripting each release:
 
 ```toml
-[child]
-version = "123456789abcdef0123456789abcdef012345678"
-url = "https://example.org/child/archive/{version}.tar.gz"
-sha256 = "<64 hexadecimal characters>"
-[child.resolve]
+[dependencies.child.resolve]
 kind = "gitlink"
 parent = "parent"
 path = "third_party/child"
@@ -490,14 +962,14 @@ recursively fetches every submodule: only declared sources are selected.
 For sources pinned in an upstream text file, use a narrow, explicit capture:
 
 ```toml
-[child.resolve]
+[dependencies.child.resolve]
 kind = "file"
 parent = "parent"
 placeholder = "${CHILD_REV}"
-[child.resolve.revision]
+[dependencies.child.resolve.revision]
 path = "cmake/dependencies.cmake"
 pattern = '(?m)^set\(CHILD_REV "([0-9a-f]{40})"\)$'
-[child.resolve.url]
+[dependencies.child.resolve.url]
 path = "cmake/dependencies.cmake"
 pattern = '(?m)^URL "(https://[^"]+)"$'
 ```
@@ -543,7 +1015,7 @@ targets = ["OpenSSL::SSL", "OpenSSL::Crypto"]
 Enable `vcpkg`/`conan` in the build dependency and maintenance CLI as needed:
 
 ```text
-cargo install woodshed --features cli,git,vcpkg,conan
+cargo install woodshed --features cli,vcpkg,conan
 woodshed add zstd --version 1.5.7 --provider vcpkg --triplet x64-windows --cmake-package zstd --target zstd::libzstd_shared --dynamic
 ```
 
@@ -589,8 +1061,15 @@ third-party recipes.
 
 #### Library and offline use
 
-`pin::plan_add` and `pin::plan_bump` accept a `Selection` and a `Resolver`.
-Inspect `Plan::changes()` or `Plan::manifest()` before calling `Plan::apply()`.
+`project::plan_add` accepts a `Dependency` and a `pin::Resolver`;
+`project::plan_bump` accepts a `pin::Selection` and a resolver.
+Inspect `Update::{changes,manifest,lock}` before calling `Update::apply()`.
+`Project::load(path)?.locked()?` reads the generated lock. Embedded callers use
+`Project::parse(path, declarations)?.parse_lock(lock_text)?`; both return the same
+`project::Lock`, with immutable source records in `lock.sources`. Embedded parsing
+validates declarations and source identities but does not read provider profiles.
+There is one persisted project model: `woodshed.toml` plus `woodshed.lock`, with
+no combined-pin format, fallback discovery or separate manifest/updater API.
 `pin::Online` supplies host-Git metadata and archive downloads.
 `pin::Offline::load` reads strict JSON fixtures without network fallback:
 

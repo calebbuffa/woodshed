@@ -17,7 +17,7 @@
 //! ```text
 //! <root>/
 //!   archives/  verified downloads, named by dependency
-//!   sources/   extracted trees, one per name-version
+//!   sources/   extracted trees, keyed by immutable source identity
 //!   builds/    build trees + install prefixes, one per BuildKey
 //! ```
 
@@ -27,6 +27,24 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+mod tree;
+#[cfg(feature = "build")]
+pub(crate) use tree::snapshot_fingerprint;
+pub(crate) use tree::tree_fingerprint;
+
+fn source_record(identity: &str, fingerprint: &str) -> String {
+    format!("woodshed-source-v1\n{identity}\n{fingerprint}\n")
+}
+
+fn verified_source_tree(root: &Path, record: &Path, identity: &str) -> Result<bool> {
+    let text = match fs::read(record) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::io("read extracted source inventory", error)),
+    };
+    Ok(text == source_record(identity, &tree_fingerprint(root)?).as_bytes())
+}
 
 /// How long to wait for another process to release a cache lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -52,7 +70,14 @@ impl Cache {
     pub fn discover() -> Result<Self> {
         println!("cargo:rerun-if-env-changed=WOODSHED_CACHE");
         println!("cargo:rerun-if-env-changed=WOODSHED_OFFLINE");
+        println!("cargo:rerun-if-env-changed=WOODSHED_LOG");
+        println!("cargo:rerun-if-env-changed=WOODSHED_PROGRESS");
+        Self::from_environment()
+    }
 
+    /// Resolve cache/offline environment settings without emitting Cargo directives.
+    /// Use this in CLI tools; build scripts should use [`Self::discover`].
+    pub fn from_environment() -> Result<Self> {
         let root = if let Some(dir) = env::var_os("WOODSHED_CACHE") {
             PathBuf::from(dir)
         } else {
@@ -112,6 +137,16 @@ impl Cache {
         self.root.join("builds")
     }
 
+    /// Mutable declarative workspaces; identities include the full hard fingerprint.
+    pub fn workspace_dir(&self, key: &BuildKey) -> PathBuf {
+        self.root.join("workspaces").join(key.fingerprint())
+    }
+
+    /// Source-owned immutable installation root, separate from mutable workspaces.
+    pub fn artifact_dir(&self, key: &BuildKey) -> PathBuf {
+        self.root.join("artifacts").join(key.fingerprint())
+    }
+
     /// A build directory unique to `key`, and its install prefix.
     ///
     /// Use this instead of `OUT_DIR` for anything expensive: it survives build
@@ -146,48 +181,17 @@ impl Cache {
         mounts: &[(PathBuf, PathBuf)],
     ) -> Result<PathBuf> {
         use sha2::{Digest, Sha256};
-        use std::path::Component;
         let source = source
             .canonicalize()
             .map_err(|error| Error::io(format!("cannot resolve {}", source.display()), error))?;
         let mut identity = Sha256::new();
         identity.update(source.as_os_str().as_encoded_bytes());
-        let mut resolved = Vec::new();
-        for (path, dependency) in mounts {
-            if path.as_os_str().is_empty()
-                || !path
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_)))
-                || mounts
-                    .iter()
-                    .any(|(other, _)| other != path && path.starts_with(other))
-                || mounts.iter().filter(|(other, _)| other == path).count() != 1
-            {
-                return Err(Error::io(
-                    "invalid or overlapping source mount",
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        path.display().to_string(),
-                    ),
-                ));
-            }
-            let dependency = dependency.canonicalize().map_err(|error| {
-                Error::io(format!("cannot resolve {}", dependency.display()), error)
-            })?;
-            if !dependency.is_dir() {
-                return Err(Error::io(
-                    "source mount is not a directory",
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        dependency.display().to_string(),
-                    ),
-                ));
-            }
+        let resolved = resolve_mounts(mounts)?;
+        for (path, dependency) in &resolved {
             identity.update([0]);
             identity.update(path.as_os_str().as_encoded_bytes());
             identity.update([0]);
             identity.update(dependency.as_os_str().as_encoded_bytes());
-            resolved.push((path.clone(), dependency));
         }
         let identity = format!("{:x}", identity.finalize());
         let directory = self.root.join("prepared").join(key.as_str());
@@ -212,38 +216,7 @@ impl Cache {
             copy_source_root(&source, &directory, Path::new(""), &resolved)?;
         }
         for (relative, dependency) in &resolved {
-            let destination = directory.join(relative);
-            if fs::symlink_metadata(&destination).is_ok() {
-                if destination
-                    .canonicalize()
-                    .is_ok_and(|path| path == *dependency)
-                {
-                    continue;
-                }
-                // An upstream submodule placeholder may be empty, but arbitrary
-                // existing trees must not be deleted or silently substituted.
-                fs::remove_dir(&destination).map_err(|error| {
-                    Error::io(
-                        format!("cannot replace nonempty mount {}", destination.display()),
-                        error,
-                    )
-                })?;
-            }
-            fs::create_dir_all(destination.parent().expect("relative mount has a parent"))
-                .map_err(|error| Error::io("cannot create source mount parent", error))?;
-            #[cfg(windows)]
-            junction::create(dependency, &destination).map_err(|error| {
-                Error::io(format!("cannot mount {}", destination.display()), error)
-            })?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(dependency, &destination).map_err(|error| {
-                Error::io(format!("cannot mount {}", destination.display()), error)
-            })?;
-            #[cfg(not(any(windows, unix)))]
-            return Err(Error::io(
-                "source mounts require a Unix or Windows host",
-                std::io::Error::from(std::io::ErrorKind::Unsupported),
-            ));
+            install_mount(&directory, relative, dependency)?;
         }
         fs::write(&marker, identity)
             .map_err(|error| Error::io("cannot complete prepared source tree", error))?;
@@ -258,6 +231,10 @@ impl Cache {
     /// verification, so a concurrent or interrupted build never observes a
     /// half-written archive.
     pub fn archive(&self, dep: &Dep) -> Result<PathBuf> {
+        self.locked_archive(dep).map(|(path, _lock)| path)
+    }
+
+    fn locked_archive(&self, dep: &Dep) -> Result<(PathBuf, Lock)> {
         if dep.git.is_some() {
             return Err(Error::Manifest {
                 detail: format!(
@@ -275,7 +252,10 @@ impl Cache {
 
         if path.is_file() {
             match crate::verify_sha256(&path, &dep.sha256) {
-                Ok(()) => return Ok(path),
+                Ok(()) => {
+                    crate::progress::notify(&format!("{}: cached archive verified", dep.name));
+                    return Ok((path, _lock));
+                }
                 Err(error) if self.offline => {
                     return Err(Error::Offline {
                         detail: format!(
@@ -312,7 +292,7 @@ impl Cache {
             });
         }
 
-        self.download_verified(dep, &path)
+        self.download_verified(dep, &path).map(|path| (path, _lock))
     }
 
     #[cfg(feature = "download")]
@@ -350,40 +330,58 @@ impl Cache {
     /// Returns the project root: if the archive unpacks to a single top-level
     /// directory, that directory, otherwise the extraction dir itself.
     ///
-    /// A tree whose [markers](Dep::markers) are missing is treated as the
-    /// debris of an interrupted extraction, deleted, and unpacked again.
+    /// Archive trees are keyed by locked checksum, not release labels. A full
+    /// content/type/permission fingerprint validates reuse; incomplete or changed
+    /// trees are reconstructed from the checksum-verified archive. Extraction is
+    /// staged and the completion record is committed last. Cached trees are
+    /// immutable inputs: use `prepare` for builds that write into their sources.
     pub fn source(&self, dep: &Dep) -> Result<PathBuf> {
+        let _progress = crate::progress::Phase::new(format!("acquire source {}", dep.name));
         if dep.git.is_some() {
             return self.git_source(dep);
         }
-        let archive = self.archive(dep)?;
-
+        if dep.sha256.len() != 64 || !dep.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Manifest {
+                detail: format!(
+                    "{}: archive sources require a full SHA-256 checksum",
+                    dep.name
+                ),
+            });
+        }
         let sources = self.sources_dir();
         fs::create_dir_all(&sources)
             .map_err(|error| Error::io(format!("cannot create {}", sources.display()), error))?;
 
         let dir = sources.join(dep.source_dir_name());
         let _lock = Lock::acquire(&lock_path(&dir, "extract"))?;
-
-        // Re-check after the lock: another process may have just finished.
-        if dir.is_dir() {
-            let root = project_root(&dir);
-            if dep.markers_present(&root) {
-                return Ok(root);
-            }
+        let stage = sidecar(&dir, "partial");
+        if let Some(metadata) = path_metadata(&stage)? {
+            remove_entry(&stage, &metadata)?;
+        }
+        let record = sidecar(&dir, "source");
+        let identity = dep.sha256.to_ascii_lowercase();
+        if dir.is_dir()
+            && dep.markers_present(&project_root(&dir))
+            && verified_source_tree(&dir, &record, &identity)?
+        {
+            crate::progress::notify(&format!("{}: cached source verified", dep.name));
+            return Ok(project_root(&dir));
+        }
+        if path_metadata(&dir)?.is_some() {
             eprintln!(
-                "woodshed: `{}` source tree is incomplete; re-extracting",
+                "woodshed: `{}` extracted source is incomplete or modified; restoring locked content",
                 dep.name
             );
-            fs::remove_dir_all(&dir)
-                .map_err(|error| Error::io(format!("cannot remove {}", dir.display()), error))?;
         }
-
-        fs::create_dir_all(&dir)
-            .map_err(|error| Error::io(format!("cannot create {}", dir.display()), error))?;
-        crate::archive::extract(&archive, &dir)?;
-
-        let root = project_root(&dir);
+        // Keep the download lock through extraction: different pinned archives
+        // can share a filename, but must never replace bytes being extracted.
+        let (archive, _archive_lock) = self.locked_archive(dep)?;
+        fs::create_dir(&stage).map_err(|error| Error::io("stage archive extraction", error))?;
+        {
+            let _progress = crate::progress::Phase::new(format!("extract {}", dep.name));
+            crate::archive::extract(&archive, &stage)?;
+        }
+        let root = project_root(&stage);
         if let Some(missing) = dep.missing_marker(&root) {
             return Err(Error::Extract {
                 archive,
@@ -394,7 +392,41 @@ impl Cache {
                 ),
             });
         }
-        Ok(root)
+        let fingerprint = tree_fingerprint(&stage)?;
+        if let Some(metadata) = path_metadata(&dir)? {
+            remove_entry(&dir, &metadata)?;
+        }
+        fs::rename(&stage, &dir).map_err(|error| Error::io("publish extracted source", error))?;
+        write_source_state(&record, source_record(&identity, &fingerprint).as_bytes())
+            .map_err(|error| Error::io("commit extracted source inventory", error))?;
+        Ok(project_root(&dir))
+    }
+
+    /// Validate cached pinned source contents without repairing or fetching.
+    ///
+    /// Useful after compilation to reject a build that modified shared inputs.
+    pub fn verify_source(&self, dep: &Dep) -> Result<()> {
+        let directory = self.sources_dir().join(dep.source_dir_name());
+        let identity = match &dep.git {
+            Some(git) => format!("{}\n{}\n", git.repository, git.revision),
+            None => dep.sha256.to_ascii_lowercase(),
+        };
+        let root = if dep.git.is_some() {
+            directory.clone()
+        } else {
+            project_root(&directory)
+        };
+        if !dep.markers_present(&root)
+            || !verified_source_tree(&directory, &sidecar(&directory, "source"), &identity)?
+        {
+            return Err(Error::Incomplete {
+                detail: format!(
+                    "{}: shared pinned source changed during compilation; use a writable prepared tree instead",
+                    dep.name
+                ),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(feature = "git")]
@@ -407,11 +439,13 @@ impl Cache {
         let _lock = Lock::acquire(&lock_path(&dir, "git"))?;
         let marker = dir.join(".woodshed-git");
         let identity = format!("{}\n{}\n", git.repository, git.revision);
+        let record = sidecar(&dir, "source");
         if marker.is_file()
             && fs::read_to_string(&marker)
                 .map_err(|error| Error::io("read Git source marker", error))?
                 == identity
             && dep.markers_present(&dir)
+            && verified_source_tree(&dir, &record, &identity)?
         {
             return Ok(dir);
         }
@@ -436,13 +470,16 @@ impl Cache {
                 detail: format!("Git source `{}` lacks marker {missing}", dep.name),
             });
         }
-        fs::write(stage.path().join(".woodshed-git"), identity)
+        fs::write(stage.path().join(".woodshed-git"), &identity)
             .map_err(|error| Error::io("mark Git source complete", error))?;
+        let fingerprint = tree_fingerprint(stage.path())?;
         if dir.exists() {
             fs::remove_dir_all(&dir)
                 .map_err(|error| Error::io("remove incomplete Git snapshot", error))?;
         }
         fs::rename(stage.path(), &dir).map_err(|error| Error::io("install Git snapshot", error))?;
+        write_source_state(&record, source_record(&identity, &fingerprint).as_bytes())
+            .map_err(|error| Error::io("commit Git source inventory", error))?;
         Ok(dir)
     }
 
@@ -465,12 +502,432 @@ impl Cache {
     /// changed.
     pub fn mirror(&self, source: &Path, key: &BuildKey) -> Result<PathBuf> {
         let dest = self.root.join("mirrors").join(key.as_str());
-        if dest.exists() {
-            fs::remove_dir_all(&dest)
-                .map_err(|error| Error::io(format!("cannot refresh {}", dest.display()), error))?;
+        self.mirror_to(source, &dest)
+    }
+
+    /// Synchronize a source tree into an explicit, exclusively owned destination.
+    ///
+    /// Unchanged file contents keep their timestamps; removed entries and changed
+    /// file types are synchronized. Source symlinks are materialized as in
+    /// [`Self::mirror`]; destination links are never traversed while updating.
+    /// Source and destination must be disjoint. A sibling lock serializes refreshes;
+    /// callers must separately coordinate readers/builds with refreshes.
+    /// Returns the caller's absolute destination spelling, without canonicalizing
+    /// build-facing paths or introducing Windows verbatim prefixes.
+    pub fn mirror_to(&self, source: &Path, destination: &Path) -> Result<PathBuf> {
+        self.mirror_filtered(source, destination, |_| false)
+    }
+
+    pub(crate) fn mirror_filtered(
+        &self,
+        source: &Path,
+        destination: &Path,
+        ignore: fn(&std::ffi::OsStr) -> bool,
+    ) -> Result<PathBuf> {
+        let output = std::path::absolute(destination)
+            .map_err(|error| Error::io("cannot resolve mirror destination", error))?;
+        let (source, destination) = source_destination(source, destination)?;
+        let _lock = Lock::acquire(&lock_path(&destination, "mirror"))?;
+        let root = resolve_path(&destination)?;
+        sync_dir(
+            &source,
+            &destination,
+            &root,
+            &mut std::collections::BTreeSet::new(),
+            ignore,
+        )?;
+        Ok(output)
+    }
+
+    /// Prepare a stable writable root with additive pinned dependency mounts.
+    ///
+    /// Unlike [`Self::prepare`], the key identifies only the pinned source family:
+    /// adding mounts does not change the root path. Previously recorded mounts
+    /// remain when omitted and cannot be rebound, removed, or overlapped.
+    /// Source and dependency identities are canonical paths, not content hashes;
+    /// callers must supply immutable pinned source trees.
+    pub fn prepare_incremental(
+        &self,
+        key: &BuildKey,
+        source: &Path,
+        mounts: &[(PathBuf, PathBuf)],
+    ) -> Result<PathBuf> {
+        self.prepare_incremental_to(
+            source,
+            &self.root.join("prepared").join(key.as_str()),
+            mounts,
+        )
+    }
+
+    /// Prepare or adopt an explicit stable root, adding mounts without recopying it.
+    ///
+    /// An existing directory is adopted as-is, preserving patches and generated
+    /// files. New roots copy the source using the same symlink conventions as
+    /// [`Self::prepare`]. A sibling identity journal and prepare lock retain the
+    /// canonical source and every mount across calls, including interrupted calls.
+    /// Conflicting links, files, nonempty directories, escaping paths, and mount
+    /// ancestors that are links are rejected rather than overwritten.
+    /// Keep the sibling `.incremental` directory alongside an adopted root.
+    /// Returns the caller's absolute destination spelling; canonical paths are
+    /// used only internally for identity, locking, and safety checks.
+    pub fn prepare_incremental_to(
+        &self,
+        source: &Path,
+        destination: &Path,
+        mounts: &[(PathBuf, PathBuf)],
+    ) -> Result<PathBuf> {
+        let output = std::path::absolute(destination)
+            .map_err(|error| Error::io("cannot resolve prepared destination", error))?;
+        let (source, destination) = source_destination(source, destination)?;
+        let _lock = Lock::acquire(&lock_path(&destination, "prepare"))?;
+        let state = lock_path(&destination, "incremental");
+        fs::create_dir_all(&state)
+            .map_err(|error| Error::io("cannot create incremental source state", error))?;
+        let source_marker = state.join("source");
+        let identity = encode_path(&source);
+        let initialized = source_marker
+            .try_exists()
+            .map_err(|error| Error::io("cannot inspect incremental source identity", error))?;
+        if initialized
+            && fs::read_to_string(&source_marker)
+                .map_err(|error| Error::io("cannot read incremental source identity", error))?
+                != identity
+        {
+            return Err(source_conflict(
+                "source-tree key reused for different inputs",
+                &destination,
+            ));
         }
-        copy_dir(source, &dest)?;
-        Ok(dest)
+        let journal = state.join("mounts");
+        let mut recorded = Vec::new();
+        match fs::read_to_string(&journal) {
+            Ok(text) => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    return Err(source_conflict("incomplete source mount journal", &journal));
+                }
+                for line in text.lines() {
+                    let (path, target) = line
+                        .split_once('\t')
+                        .ok_or_else(|| source_conflict("invalid source mount journal", &journal))?;
+                    recorded.push((decode_path(path)?, decode_path(target)?));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io("cannot read source mount journal", error)),
+        }
+        validate_mounts(&recorded)?;
+        let old_count = recorded.len();
+        let requested = resolve_mounts(mounts)?;
+        for (path, target) in &requested {
+            if let Some((_, existing)) = recorded
+                .iter()
+                .find(|(existing, _)| mount_path(existing) == mount_path(path))
+            {
+                if existing != target {
+                    return Err(source_conflict("source mount identity changed", path));
+                }
+            } else {
+                recorded.push((path.clone(), target.clone()));
+            }
+        }
+        validate_mounts(&recorded)?;
+        for (path, target) in &recorded {
+            if target.starts_with(&destination) || destination.starts_with(target) {
+                return Err(source_conflict("source mount overlaps prepared root", path));
+            }
+            check_mount(&destination, path, target)?;
+        }
+        if !initialized {
+            // Record adoption before mutation; retries of a new tree must finish
+            // copying, while retries of an adopted tree must never overwrite it.
+            if destination.is_dir() {
+                write_source_state(&state.join("copied"), b"")
+                    .map_err(|error| Error::io("cannot record source adoption", error))?;
+            }
+            write_source_state(&source_marker, identity.as_bytes())
+                .map_err(|error| Error::io("cannot record incremental source identity", error))?;
+        }
+        if recorded.len() != old_count {
+            let text: String = recorded
+                .iter()
+                .map(|(path, target)| format!("{}\t{}\n", encode_path(path), encode_path(target)))
+                .collect();
+            write_source_state(&journal, text.as_bytes())
+                .map_err(|error| Error::io("cannot persist source mounts", error))?;
+        }
+        if !state
+            .join("copied")
+            .try_exists()
+            .map_err(|error| Error::io("cannot inspect source copy marker", error))?
+        {
+            copy_source_root(&source, &destination, Path::new(""), &recorded)?;
+            write_source_state(&state.join("copied"), b"")
+                .map_err(|error| Error::io("cannot complete incremental source copy", error))?;
+        }
+        if !destination.is_dir() {
+            return Err(source_conflict("prepared root is missing", &destination));
+        }
+        for (path, target) in &recorded {
+            install_mount(&destination, path, target)?;
+        }
+        Ok(output)
+    }
+}
+
+fn source_conflict(context: &str, path: &Path) -> Error {
+    Error::io(
+        context,
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, path.display().to_string()),
+    )
+}
+
+fn write_source_state(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    let temporary = lock_path(path, &format!("{}-{stamp}.partial", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = std::path::absolute(path)
+                .map_err(|error| Error::io("cannot resolve destination", error))?;
+            let parent = absolute
+                .parent()
+                .ok_or_else(|| source_conflict("invalid destination", path))?;
+            Ok(resolve_path(parent)?.join(
+                absolute
+                    .file_name()
+                    .ok_or_else(|| source_conflict("invalid destination", path))?,
+            ))
+        }
+        Err(error) => Err(Error::io("cannot resolve destination", error)),
+    }
+}
+
+fn source_destination(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf)> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| Error::io("cannot resolve source directory", error))?;
+    if !source.is_dir() {
+        return Err(source_conflict("source is not a directory", &source));
+    }
+    if path_metadata(destination)?.is_some_and(|meta| is_link(&meta) || !meta.is_dir()) {
+        return Err(source_conflict(
+            "destination must be a real directory",
+            destination,
+        ));
+    }
+    let destination = resolve_path(destination)?;
+    if source.starts_with(&destination) || destination.starts_with(&source) {
+        return Err(source_conflict(
+            "source and destination overlap",
+            &destination,
+        ));
+    }
+    Ok((source, destination))
+}
+
+fn path_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::io(
+            format!("cannot inspect {}", path.display()),
+            error,
+        )),
+    }
+}
+
+pub(crate) fn is_link(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn validate_mounts(mounts: &[(PathBuf, PathBuf)]) -> Result<()> {
+    use std::path::Component;
+    for (index, (path, target)) in mounts.iter().enumerate() {
+        if path.as_os_str().is_empty()
+            || !path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            || mounts[..index].iter().any(|(other, _)| {
+                let path = mount_path(path);
+                let other = mount_path(other);
+                path.starts_with(&other) || other.starts_with(&path)
+            })
+            || !target.is_dir()
+        {
+            return Err(source_conflict("invalid or overlapping source mount", path));
+        }
+        #[cfg(windows)]
+        for component in path.components() {
+            let component = component.as_os_str().to_string_lossy();
+            if component.ends_with(['.', ' ']) || component.contains(':') {
+                return Err(source_conflict("ambiguous Windows source mount", path));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mounts(mounts: &[(PathBuf, PathBuf)]) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let resolved = mounts
+        .iter()
+        .map(|(path, target)| {
+            target
+                .canonicalize()
+                .map(|target| (path.clone(), target))
+                .map_err(|error| Error::io(format!("cannot resolve {}", target.display()), error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_mounts(&resolved)?;
+    Ok(resolved)
+}
+
+fn check_mount(root: &Path, relative: &Path, target: &Path) -> Result<()> {
+    let mut parent = root.to_path_buf();
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        parent.push(component);
+        if path_metadata(&parent)?.is_some_and(|meta| is_link(&meta) || !meta.is_dir()) {
+            return Err(source_conflict(
+                "source mount ancestor is not a real directory",
+                &parent,
+            ));
+        }
+    }
+    let destination = root.join(relative);
+    if let Some(meta) = path_metadata(&destination)? {
+        if is_link(&meta)
+            && destination
+                .canonicalize()
+                .is_ok_and(|existing| existing == target)
+        {
+            return Ok(());
+        }
+        if is_link(&meta)
+            || !meta.is_dir()
+            || fs::read_dir(&destination)
+                .map_err(|error| Error::io("cannot inspect source mount directory", error))?
+                .next()
+                .transpose()
+                .map_err(|error| Error::io("cannot inspect source mount entry", error))?
+                .is_some()
+        {
+            return Err(source_conflict(
+                "source mount conflicts with existing destination",
+                &destination,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mount_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+fn install_mount(root: &Path, relative: &Path, target: &Path) -> Result<()> {
+    check_mount(root, relative, target)?;
+    let destination = root.join(relative);
+    if path_metadata(&destination)?.is_some_and(|meta| is_link(&meta)) {
+        return Ok(());
+    }
+    if destination.exists() {
+        fs::remove_dir(&destination)
+            .map_err(|error| Error::io("cannot replace empty mount placeholder", error))?;
+    }
+    fs::create_dir_all(destination.parent().expect("mount parent"))
+        .map_err(|error| Error::io("cannot create source mount parent", error))?;
+    #[cfg(windows)]
+    junction::create(target, &destination)
+        .map_err(|error| Error::io("cannot create source mount", error))?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, &destination)
+        .map_err(|error| Error::io("cannot create source mount", error))?;
+    #[cfg(not(any(windows, unix)))]
+    return Err(source_conflict(
+        "source mounts require Unix or Windows",
+        &destination,
+    ));
+    Ok(())
+}
+
+fn encode_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let bytes: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_path(text: &str) -> Result<PathBuf> {
+    let invalid = || source_conflict("invalid path in source mount journal", Path::new(text));
+    if !text.is_ascii() || !text.len().is_multiple_of(2) {
+        return Err(invalid());
+    }
+    let bytes = (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| invalid()))
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if !bytes.len().is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let wide = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        Ok(std::ffi::OsString::from_wide(&wide).into())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes).into())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Ok(String::from_utf8(bytes).map_err(|_| invalid())?.into())
     }
 }
 
@@ -480,6 +937,12 @@ fn copy_source_root(
     relative: &Path,
     mounts: &[(PathBuf, PathBuf)],
 ) -> Result<()> {
+    if path_metadata(destination)?.is_some_and(|meta| is_link(&meta) || !meta.is_dir()) {
+        return Err(source_conflict(
+            "source-tree directory conflicts with destination",
+            destination,
+        ));
+    }
     fs::create_dir_all(destination)
         .map_err(|error| Error::io("cannot create source-tree directory", error))?;
     for entry in
@@ -563,9 +1026,18 @@ fn copy_source_root(
             }
         } else if kind.is_dir() {
             copy_source_root(&entry.path(), &target, &relative, mounts)?;
-        } else if !target.is_file()
-            || crate::sha256_file(&entry.path())? != crate::sha256_file(&target)?
-        {
+        } else {
+            if path_metadata(&target)?.is_some_and(|meta| is_link(&meta) || !meta.is_file()) {
+                return Err(source_conflict(
+                    "source-tree file conflicts with destination",
+                    &target,
+                ));
+            }
+            if target.is_file()
+                && crate::sha256_file(&entry.path())? == crate::sha256_file(&target)?
+            {
+                continue;
+            }
             fs::copy(entry.path(), &target).map_err(|error| {
                 Error::io(
                     format!(
@@ -581,8 +1053,43 @@ fn copy_source_root(
     Ok(())
 }
 
-/// Recursively copy every entry under `source` into `dest`.
+/// Synchronize materialized entries, never following destination links.
+#[cfg(test)]
 fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
+    let root = resolve_path(dest)?;
+    sync_dir(
+        source,
+        dest,
+        &root,
+        &mut std::collections::BTreeSet::new(),
+        |_| false,
+    )
+}
+
+fn sync_dir(
+    source: &Path,
+    dest: &Path,
+    root: &Path,
+    ancestors: &mut std::collections::BTreeSet<PathBuf>,
+    ignore: fn(&std::ffi::OsStr) -> bool,
+) -> Result<()> {
+    let resolved = source
+        .canonicalize()
+        .map_err(|error| Error::io("cannot resolve mirror source directory", error))?;
+    if resolved.starts_with(root)
+        || root.starts_with(&resolved)
+        || !ancestors.insert(resolved.clone())
+    {
+        return Err(source_conflict(
+            "mirror source link cycles or overlaps destination",
+            source,
+        ));
+    }
+    if let Some(meta) = path_metadata(dest)?
+        && (is_link(&meta) || !meta.is_dir())
+    {
+        remove_entry(dest, &meta)?;
+    }
     fs::create_dir_all(dest)
         .map_err(|error| Error::io(format!("cannot create {}", dest.display()), error))?;
 
@@ -592,19 +1099,106 @@ fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
     for entry in entries {
         let entry =
             entry.map_err(|error| Error::io(format!("cannot read {}", source.display()), error))?;
+        if ignore(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let target = dest.join(entry.file_name());
 
         if path.is_dir() {
-            copy_dir(&path, &target)?;
+            sync_dir(&path, &target, root, ancestors, ignore)?;
         } else {
+            if let Some(meta) = path_metadata(&target)? {
+                if is_link(&meta) || !meta.is_file() {
+                    remove_entry(&target, &meta)?;
+                } else if crate::sha256_file(&path)? == crate::sha256_file(&target)? {
+                    let permissions = fs::metadata(&path)
+                        .map_err(|error| Error::io("inspect mirror input permissions", error))?
+                        .permissions();
+                    if permissions != meta.permissions() {
+                        fs::set_permissions(&target, permissions)
+                            .map_err(|error| Error::io("synchronize mirror permissions", error))?;
+                    }
+                    continue;
+                }
+            }
+            #[cfg(windows)]
+            if let Some(meta) = path_metadata(&target)? {
+                make_writable(&target, &meta)
+                    .map_err(|error| Error::io("cannot refresh read-only mirror file", error))?;
+            }
             fs::copy(&path, &target).map_err(|error| {
                 Error::io(
                     format!("cannot copy {} to {}", path.display(), target.display()),
                     error,
                 )
             })?;
+            // CopyFile on Windows preserves input mtimes, even when changed
+            // bytes have the same timestamp as the previous mirror contents.
+            #[cfg(windows)]
+            let file = {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new().access_mode(0x100).open(&target)
+            };
+            #[cfg(not(windows))]
+            let file = fs::File::open(&target);
+            file.and_then(|file| file.set_modified(std::time::SystemTime::now()))
+                .map_err(|error| Error::io("cannot timestamp refreshed mirror file", error))?;
         }
+    }
+    for entry in
+        fs::read_dir(dest).map_err(|error| Error::io("cannot read mirror destination", error))?
+    {
+        let entry = entry.map_err(|error| Error::io("cannot read mirror entry", error))?;
+        if ignore(&entry.file_name()) || path_metadata(&source.join(entry.file_name()))?.is_none() {
+            let meta = fs::symlink_metadata(entry.path())
+                .map_err(|error| Error::io("cannot inspect obsolete mirror entry", error))?;
+            remove_entry(&entry.path(), &meta)?;
+        }
+    }
+    ancestors.remove(&resolved);
+    Ok(())
+}
+
+pub(crate) fn remove_entry(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    #[cfg(windows)]
+    if !is_link(meta) {
+        make_writable(path, meta)
+            .map_err(|error| Error::io("cannot remove read-only mirror entry", error))?;
+    }
+    #[cfg(windows)]
+    let directory_link = is_link(meta) && {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x10 != 0
+    };
+    #[cfg(not(windows))]
+    let directory_link = false;
+    let result = if directory_link {
+        fs::remove_dir(path)
+    } else if meta.is_dir() && !is_link(meta) {
+        for entry in fs::read_dir(path)
+            .map_err(|error| Error::io("cannot read obsolete mirror directory", error))?
+        {
+            let entry =
+                entry.map_err(|error| Error::io("cannot read obsolete mirror entry", error))?;
+            let meta = fs::symlink_metadata(entry.path())
+                .map_err(|error| Error::io("cannot inspect obsolete mirror entry", error))?;
+            remove_entry(&entry.path(), &meta)?;
+        }
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| Error::io(format!("cannot remove {}", path.display()), error))
+}
+
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)] // Windows attributes, not Unix mode bits.
+fn make_writable(path: &Path, meta: &fs::Metadata) -> std::io::Result<()> {
+    let mut permissions = meta.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
     }
     Ok(())
 }
@@ -685,6 +1279,18 @@ impl BuildKey {
         }
     }
 
+    /// Start an explicit identity without implicit process-environment inputs.
+    ///
+    /// The caller must supply every relevant input. Declarative orchestration
+    /// uses structured identities rather than inheriting Cargo's target for host tools.
+    pub fn explicit(label: impl Into<String>) -> Self {
+        use sha2::Digest;
+        Self {
+            hasher: sha2::Sha256::new(),
+            label: label.into(),
+        }
+    }
+
     /// Mix in a dependency's pinned identity.
     #[must_use]
     pub fn dep(self, dep: &Dep) -> Self {
@@ -724,6 +1330,16 @@ impl BuildKey {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         format!("{}-{hex}", self.label)
+    }
+
+    /// Full SHA-256 identity for immutable artifacts and hard workspace boundaries.
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        let mut hash = self.hasher.clone();
+        hash.update(b"\0woodshed-label\0");
+        hash.update((self.label.len() as u64).to_le_bytes());
+        hash.update(self.label.as_bytes());
+        format!("{:x}", hash.finalize())
     }
 }
 
@@ -766,13 +1382,26 @@ pub(crate) struct Lock {
 /// `geos-3.14.1-a1b2c3d4` and `geos-3.14.1-99887766` reduce to
 /// `geos-3.14.build.lock`.
 pub(crate) fn lock_path(path: &Path, kind: &str) -> PathBuf {
+    sidecar(path, &format!("{kind}.lock"))
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{kind}.lock"));
+    name.push(format!(".{suffix}"));
     path.with_file_name(name)
 }
 
 impl Lock {
+    #[cfg(feature = "build")]
+    pub(crate) fn acquire_shared(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, true)
+    }
+
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, false)
+    }
+
+    fn acquire_mode(path: &Path, shared: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| Error::io(format!("cannot create {}", parent.display()), error))?;
@@ -792,8 +1421,13 @@ impl Lock {
             })?;
 
         let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+        let mut waiting = None;
         loop {
-            match file.try_lock_exclusive() {
+            match if shared {
+                FileExt::try_lock_shared(&file)
+            } else {
+                FileExt::try_lock_exclusive(&file)
+            } {
                 Ok(true) => {
                     return Ok(Self {
                         file,
@@ -801,6 +1435,9 @@ impl Lock {
                     });
                 }
                 Ok(false) | Err(_) if std::time::Instant::now() < deadline => {
+                    waiting.get_or_insert_with(|| {
+                        crate::progress::Phase::new(format!("wait for lock {}", path.display()))
+                    });
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Ok(false) => {
@@ -877,6 +1514,118 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "tar-gz")]
+    #[test]
+    fn archive_sources_are_content_addressed_verified_and_repaired_offline() {
+        fn archive(path: &Path, contents: &[u8]) -> String {
+            let file = fs::File::create(path).unwrap();
+            let compressed = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(compressed);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, "package/input.h", contents)
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            crate::sha256_file(path).unwrap()
+        }
+
+        let directory = temp_dir("source-content");
+        let cache = Cache::at(&directory).offline(true);
+        fs::create_dir_all(cache.archives_dir()).unwrap();
+        let archive_path = cache.archives_dir().join("package.tar.gz");
+        let first = Dep::new(
+            "same",
+            "1",
+            "https://example.test/package.tar.gz",
+            archive(&archive_path, b"first!"),
+        )
+        .with_markers(["input.h"]);
+        let unrelated = cache.sources_dir().join("same-1");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("input.h"), b"unrelated").unwrap();
+        let original = cache.source(&first).unwrap();
+        assert_ne!(original, unrelated);
+        assert_eq!(fs::read(unrelated.join("input.h")).unwrap(), b"unrelated");
+        let first_modified = fs::metadata(original.join("input.h"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let second = Dep::new(
+            "same",
+            "1",
+            "https://example.test/package.tar.gz",
+            archive(&archive_path, b"second"),
+        )
+        .with_markers(["input.h"]);
+        let updated = cache.source(&second).unwrap();
+        assert_ne!(original, updated);
+        assert_eq!(fs::read(original.join("input.h")).unwrap(), b"first!");
+        assert_eq!(fs::read(updated.join("input.h")).unwrap(), b"second");
+        assert_eq!(cache.source(&first).unwrap(), original);
+        assert_eq!(
+            fs::metadata(original.join("input.h"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_modified
+        );
+        let modified = fs::metadata(updated.join("input.h"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::write(updated.join("input.h"), b"BROKEN").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(updated.join("input.h"))
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::write(updated.join("unexpected"), b"remove").unwrap();
+        assert_eq!(cache.source(&second).unwrap(), updated);
+        assert_eq!(fs::read(updated.join("input.h")).unwrap(), b"second");
+        assert!(!updated.join("unexpected").exists());
+        fs::remove_file(updated.join("input.h")).unwrap();
+        cache.source(&second).unwrap();
+        assert_eq!(fs::read(updated.join("input.h")).unwrap(), b"second");
+        let incomplete = second.clone().with_markers(["absent.h"]);
+        assert!(cache.source(&incomplete).is_err());
+        assert_eq!(fs::read(updated.join("input.h")).unwrap(), b"second");
+        fs::remove_file(&archive_path).unwrap();
+        assert_eq!(cache.source(&second).unwrap(), updated);
+        let record = sidecar(updated.parent().unwrap(), "source");
+        fs::write(&record, b"invalid").unwrap();
+        assert!(
+            cache.source(&second).is_err(),
+            "unverified extraction needs a verified archive"
+        );
+        assert_eq!(archive(&archive_path, b"second"), second.sha256);
+        assert_eq!(cache.source(&second).unwrap(), updated);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_tree_fingerprints_preserve_relative_links_and_reject_escapes_and_cycles() {
+        let directory = temp_dir("tree-links");
+        let root = directory.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"content").unwrap();
+        std::os::unix::fs::symlink("file", root.join("alias")).unwrap();
+        let original = tree_fingerprint(&root).unwrap();
+        assert_eq!(tree_fingerprint(&root).unwrap(), original);
+        fs::write(root.join("file"), b"changed").unwrap();
+        assert_ne!(tree_fingerprint(&root).unwrap(), original);
+        fs::write(directory.join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("escape")).unwrap();
+        assert!(tree_fingerprint(&root).is_err());
+        fs::remove_file(root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("cycle")).unwrap();
+        assert!(tree_fingerprint(&root).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn build_key_is_deterministic_and_sensitive() {
         let base = BuildKey::new("geos").mix("a").as_str();
@@ -946,6 +1695,443 @@ mod tests {
         assert_eq!(fs::read(dst.join("nested/deep/leaf.txt")).unwrap(), b"leaf");
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn mirror_preserves_unchanged_timestamps_and_updates_by_content() {
+        let root = temp_dir("mirror-content");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("same"), b"same").unwrap();
+        fs::write(source.join("changed"), b"before").unwrap();
+        fs::write(source.join("nested/removed"), b"remove").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("mirror");
+        let dest = cache.mirror(&source, &key).unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(946684800);
+        for path in [
+            source.join("changed"),
+            dest.join("changed"),
+            dest.join("same"),
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        fs::write(source.join("changed"), b"AFTER!").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(source.join("changed"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        fs::remove_file(source.join("nested/removed")).unwrap();
+        fs::write(source.join("added"), b"added").unwrap();
+        assert_eq!(cache.mirror(&source, &key).unwrap(), dest);
+        assert_eq!(
+            fs::metadata(dest.join("same")).unwrap().modified().unwrap(),
+            old
+        );
+        assert_eq!(fs::read(dest.join("changed")).unwrap(), b"AFTER!");
+        assert_ne!(
+            fs::metadata(dest.join("changed"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            old
+        );
+        assert!(!dest.join("nested/removed").exists());
+        assert_eq!(fs::read(dest.join("added")).unwrap(), b"added");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mirror_handles_file_directory_transitions_and_explicit_paths() {
+        let root = temp_dir("mirror-types");
+        let source = root.join("source");
+        let dest = root.join("existing-mirror");
+        fs::create_dir_all(source.join("directory")).unwrap();
+        fs::create_dir_all(dest.join("file")).unwrap();
+        fs::write(source.join("file"), b"file").unwrap();
+        fs::write(source.join("directory/child"), b"child").unwrap();
+        fs::write(dest.join("directory"), b"previous file").unwrap();
+        fs::write(dest.join("file/old"), b"previous directory").unwrap();
+        fs::create_dir_all(dest.join("obsolete/nested")).unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let result = cache.mirror_to(&source, &dest).unwrap();
+        assert_eq!(result, std::path::absolute(&dest).unwrap());
+        assert_eq!(fs::read(dest.join("file")).unwrap(), b"file");
+        assert_eq!(fs::read(dest.join("directory/child")).unwrap(), b"child");
+        assert!(!dest.join("obsolete").exists());
+        assert!(cache.mirror_to(&source, &source).is_err());
+        assert!(cache.mirror_to(&source, &source.join("inside")).is_err());
+        assert!(cache.mirror_to(&source, &root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn directory_link(source: &Path, destination: &Path) {
+        #[cfg(windows)]
+        junction::create(source, destination).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source, destination).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn build_facing_paths_preserve_destination_spelling() {
+        let root = temp_dir("destination-spelling");
+        let source = root.join("source");
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::write(source.join("input"), b"input").unwrap();
+        directory_link(&real, &alias);
+        let cache = Cache::at(alias.join("cache"));
+        let key = BuildKey::new("paths");
+        let mirror = cache.mirror(&source, &key).unwrap();
+        assert_eq!(mirror, alias.join("cache/mirrors").join(key.as_str()));
+        assert_eq!(cache.mirror(&source, &key).unwrap(), mirror);
+        let explicit = alias.join("explicit-mirror");
+        assert_eq!(cache.mirror_to(&source, &explicit).unwrap(), explicit);
+        let prepared = cache.prepare_incremental(&key, &source, &[]).unwrap();
+        assert_eq!(prepared, alias.join("cache/prepared").join(key.as_str()));
+        assert_eq!(
+            cache.prepare_incremental(&key, &source, &[]).unwrap(),
+            prepared
+        );
+        let explicit = alias.join("explicit-prepared");
+        assert_eq!(
+            cache
+                .prepare_incremental_to(&source, &explicit, &[])
+                .unwrap(),
+            explicit
+        );
+        // Aliases share canonical identity and state, not independent workspaces.
+        fs::write(prepared.join("input"), b"patched").unwrap();
+        cache
+            .prepare_incremental_to(
+                &source,
+                &real.join("cache/prepared").join(key.as_str()),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(fs::read(prepared.join("input")).unwrap(), b"patched");
+        assert_ne!(prepared, prepared.canonicalize().unwrap());
+        #[cfg(windows)]
+        for path in [mirror, prepared, explicit] {
+            assert!(!path.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn mirror_materializes_source_links_but_never_writes_through_destination_links() {
+        let root = temp_dir("mirror-links");
+        let source = root.join("source");
+        let dest = root.join("destination");
+        let external = root.join("external");
+        fs::create_dir_all(source.join("directory")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("keep"), b"keep").unwrap();
+        fs::write(source.join("directory/new"), b"new").unwrap();
+        directory_link(&external, &dest.join("directory"));
+        directory_link(&external, &dest.join("obsolete"));
+        directory_link(&external, &source.join("linked"));
+        let cache = Cache::at(root.join("cache"));
+        cache.mirror_to(&source, &dest).unwrap();
+        assert_eq!(fs::read(external.join("keep")).unwrap(), b"keep");
+        assert!(!external.join("new").exists());
+        assert!(!is_link(
+            &fs::symlink_metadata(dest.join("directory")).unwrap()
+        ));
+        assert!(!is_link(
+            &fs::symlink_metadata(dest.join("linked")).unwrap()
+        ));
+        assert_eq!(fs::read(dest.join("linked/keep")).unwrap(), b"keep");
+        assert!(!dest.join("obsolete").exists());
+        directory_link(&source, &source.join("cycle"));
+        assert!(cache.mirror_to(&source, &dest).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_sources_keep_root_patches_and_accumulate_pinned_mounts() {
+        let root = temp_dir("incremental");
+        let source = root.join("source");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(source.join("deps/first")).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(source.join("root.txt"), b"upstream").unwrap();
+        fs::write(first.join("first.h"), b"first").unwrap();
+        fs::write(second.join("second.h"), b"second").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("family");
+        let prepared = cache
+            .prepare_incremental(&key, &source, &[("deps/first".into(), first.clone())])
+            .unwrap();
+        fs::write(prepared.join("root.txt"), b"patched").unwrap();
+        let modified = fs::metadata(prepared.join("root.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            cache
+                .prepare_incremental(&key, &source, &[("deps/second".into(), second.clone()),])
+                .unwrap(),
+            prepared
+        );
+        assert_eq!(
+            cache.prepare_incremental(&key, &source, &[]).unwrap(),
+            prepared
+        );
+        assert_eq!(fs::read(prepared.join("root.txt")).unwrap(), b"patched");
+        assert_eq!(
+            fs::metadata(prepared.join("root.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+        assert_eq!(
+            fs::read(prepared.join("deps/first/first.h")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(prepared.join("deps/second/second.h")).unwrap(),
+            b"second"
+        );
+        assert!(
+            cache
+                .prepare_incremental(&key, &source, &[("deps/first".into(), second.clone()),])
+                .is_err()
+        );
+        assert!(cache.prepare_incremental(&key, &second, &[]).is_err());
+        assert!(
+            cache
+                .prepare_incremental(&key, &source, &[("deps".into(), second.clone()),])
+                .is_err()
+        );
+        assert!(
+            cache
+                .prepare_incremental(&key, &source, &[("deps/first/nested".into(), second),])
+                .is_err()
+        );
+        assert_eq!(fs::read(source.join("root.txt")).unwrap(), b"upstream");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_adoption_preserves_existing_files_and_rejects_conflicts() {
+        let root = temp_dir("incremental-adopt");
+        let source = root.join("source");
+        let dependency = root.join("dependency");
+        let destination = root.join("existing-tree");
+        for path in [&source, &dependency, &destination] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source.join("root.txt"), b"upstream").unwrap();
+        fs::write(destination.join("root.txt"), b"patched existing tree").unwrap();
+        fs::create_dir_all(destination.join("nonempty")).unwrap();
+        fs::write(destination.join("nonempty/keep"), b"keep").unwrap();
+        fs::write(destination.join("file"), b"keep").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        for paths in [
+            vec!["nonempty"],
+            vec!["file"],
+            vec!["../escape"],
+            vec!["dep", "dep"],
+            vec!["dep", "dep/nested"],
+        ] {
+            let mounts = paths
+                .into_iter()
+                .map(|path| (path.into(), dependency.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                cache
+                    .prepare_incremental_to(&source, &destination, &mounts)
+                    .is_err()
+            );
+        }
+        let prepared = cache
+            .prepare_incremental_to(&source, &destination, &[("dep".into(), dependency.clone())])
+            .unwrap();
+        assert_eq!(prepared, std::path::absolute(&destination).unwrap());
+        assert_eq!(
+            fs::read(destination.join("root.txt")).unwrap(),
+            b"patched existing tree"
+        );
+        assert_eq!(
+            fs::read(destination.join("nonempty/keep")).unwrap(),
+            b"keep"
+        );
+        directory_link(&dependency, &destination.join("linked-parent"));
+        assert!(
+            cache
+                .prepare_incremental_to(
+                    &source,
+                    &destination,
+                    &[("linked-parent/escape".into(), source.clone()),]
+                )
+                .is_err()
+        );
+        assert!(!dependency.join("escape").exists());
+        // Even a previously recorded mount may not be silently substituted.
+        let mount = destination.join("dep");
+        remove_entry(&mount, &fs::symlink_metadata(&mount).unwrap()).unwrap();
+        directory_link(&source, &mount);
+        assert!(
+            cache
+                .prepare_incremental_to(&source, &destination, &[])
+                .is_err()
+        );
+        assert_eq!(
+            mount.canonicalize().unwrap(),
+            source.canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_sources_retry_incomplete_copy_and_repair_missing_mounts() {
+        let root = temp_dir("incremental-retry");
+        let source = root.join("source");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(source.join("root.txt"), b"upstream").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("retry");
+        let prepared = cache
+            .prepare_incremental(&key, &source, &[("dep".into(), dependency)])
+            .unwrap();
+        fs::remove_file(lock_path(&prepared, "incremental").join("copied")).unwrap();
+        fs::remove_file(prepared.join("root.txt")).unwrap();
+        let mount = prepared.join("dep");
+        remove_entry(&mount, &fs::symlink_metadata(&mount).unwrap()).unwrap();
+        cache.prepare_incremental(&key, &source, &[]).unwrap();
+        assert_eq!(fs::read(prepared.join("root.txt")).unwrap(), b"upstream");
+        assert!(prepared.join("dep").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_sources_serialize_concurrent_additions() {
+        let root = temp_dir("incremental-concurrent");
+        let source = root.join("source");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("concurrent");
+        let prepared = cache.prepare_incremental(&key, &source, &[]).unwrap();
+        std::thread::scope(|scope| {
+            for name in ["first", "second"] {
+                let cache = &cache;
+                let key = &key;
+                let source = &source;
+                let dependency = &dependency;
+                scope.spawn(move || {
+                    cache
+                        .prepare_incremental(key, source, &[(name.into(), dependency.clone())])
+                        .unwrap();
+                });
+            }
+        });
+        cache.prepare_incremental(&key, &source, &[]).unwrap();
+        assert!(prepared.join("first").is_dir());
+        assert!(prepared.join("second").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_state_path_encoding_roundtrips() {
+        let path = PathBuf::from("a\tb\nc/with spaces");
+        assert_eq!(decode_path(&encode_path(&path)).unwrap(), path);
+        assert!(decode_path("xx").is_err());
+        assert!(decode_path("0").is_err());
+        assert!(decode_path("\u{e9}00").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mirror_refreshes_and_removes_readonly_files() {
+        let root = temp_dir("mirror-readonly");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("obsolete")).unwrap();
+        fs::write(source.join("file"), b"before").unwrap();
+        fs::write(source.join("obsolete/file"), b"remove").unwrap();
+        for path in [source.join("file"), source.join("obsolete/file")] {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("readonly");
+        let dest = cache.mirror(&source, &key).unwrap();
+        assert!(
+            fs::metadata(dest.join("file"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        make_writable(
+            &source.join("file"),
+            &fs::metadata(source.join("file")).unwrap(),
+        )
+        .unwrap();
+        fs::write(source.join("file"), b"after").unwrap();
+        let mut permissions = fs::metadata(source.join("file")).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(source.join("file"), permissions).unwrap();
+        remove_entry(
+            &source.join("obsolete"),
+            &fs::metadata(source.join("obsolete")).unwrap(),
+        )
+        .unwrap();
+        cache.mirror(&source, &key).unwrap();
+        assert_eq!(fs::read(dest.join("file")).unwrap(), b"after");
+        assert!(!dest.join("obsolete").exists());
+        remove_entry(&root, &fs::metadata(&root).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn incremental_mounts_reject_windows_aliases() {
+        let root = temp_dir("incremental-aliases");
+        let source = root.join("source");
+        let dependency = root.join("dependency");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let key = BuildKey::new("aliases");
+        for paths in [
+            vec!["dep", "DEP"],
+            vec!["DEP", "dep/nested"],
+            vec!["dep."],
+            vec!["dep "],
+            vec!["dep:stream"],
+        ] {
+            let mounts = paths
+                .into_iter()
+                .map(|path| (path.into(), dependency.clone()))
+                .collect::<Vec<_>>();
+            assert!(cache.prepare_incremental(&key, &source, &mounts).is_err());
+        }
+        cache
+            .prepare_incremental(&key, &source, &[("dep".into(), dependency.clone())])
+            .unwrap();
+        cache
+            .prepare_incremental(&key, &source, &[("DEP".into(), dependency)])
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

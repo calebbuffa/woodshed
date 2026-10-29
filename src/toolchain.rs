@@ -22,10 +22,18 @@ pub struct Toolchain {
 impl Toolchain {
     /// Detect the fastest safe toolchain for the current target.
     pub fn detect() -> Self {
+        Self::detect_with_msvc(env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc"))
+    }
+
+    /// Detect a toolchain for an explicit host or target triple.
+    pub fn detect_for_target(target: &str) -> Self {
+        Self::detect_with_msvc(target.ends_with("-msvc"))
+    }
+
+    fn detect_with_msvc(is_msvc: bool) -> Self {
         // Ninja needs `cl.exe`'s environment on MSVC, which the Visual Studio
         // generator sets up itself. Only prefer Ninja there if that
         // environment is already present.
-        let is_msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
         let msvc_env_ready = env::var_os("INCLUDE").is_some() && env::var_os("LIB").is_some();
         let ninja = find_on_path("ninja").filter(|_| !is_msvc || msvc_env_ready);
 
@@ -54,6 +62,11 @@ impl Toolchain {
     /// The number of parallel jobs that will be requested.
     pub fn job_count(&self) -> usize {
         self.jobs
+    }
+
+    /// Explicit or automatically selected CMake generator; None uses CMake's default.
+    pub fn generator_name(&self) -> Option<&str> {
+        self.generator.as_deref()
     }
 
     /// Recreate `build_dir` if it was configured against a different generator
@@ -121,6 +134,20 @@ fn normalize_cmake_path(path: &str, windows: bool) -> String {
 }
 
 impl Toolchain {
+    /// Append the generator and compiler-cache flags for both C and C++.
+    ///
+    /// Use [`Self::apply_to_configure`] instead for a single project-specific
+    /// compiler launcher variable.
+    pub fn apply_to_configure_default(&self, command: &mut Command) {
+        self.apply_to_configure(command, "CMAKE_CXX_COMPILER_LAUNCHER");
+        if let Some(launcher) = &self.compiler_launcher {
+            command.arg(format!(
+                "-DCMAKE_C_COMPILER_LAUNCHER={}",
+                launcher.display()
+            ));
+        }
+    }
+
     /// Append this choice's flags to a `cmake -S -B ...` command.
     ///
     /// `compiler_launcher_define` is the cache variable the project reads for
@@ -222,6 +249,49 @@ fn force_recreate_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_cache_defaults_cover_c_and_cxx_and_overrides_are_exclusive() {
+        let toolchain = Toolchain {
+            generator: Some("Ninja".into()),
+            compiler_launcher: Some(PathBuf::from("cache-tool")),
+            jobs: 1,
+        };
+        let mut command = Command::new("cmake");
+        toolchain.apply_to_configure_default(&mut command);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-G",
+                "Ninja",
+                "-DCMAKE_CXX_COMPILER_LAUNCHER=cache-tool",
+                "-DCMAKE_C_COMPILER_LAUNCHER=cache-tool",
+            ]
+        );
+        for define in [
+            "CMAKE_C_COMPILER_LAUNCHER",
+            "CMAKE_CXX_COMPILER_LAUNCHER",
+            "CUSTOM_LAUNCHER",
+        ] {
+            let mut command = Command::new("cmake");
+            toolchain.apply_to_configure(&mut command, define);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    std::ffi::OsStr::new("-G"),
+                    std::ffi::OsStr::new("Ninja"),
+                    std::ffi::OsStr::new(&format!("-D{define}=cache-tool")),
+                ]
+            );
+        }
+        let mut command = Command::new("cmake");
+        Toolchain {
+            compiler_launcher: None,
+            ..toolchain
+        }
+        .apply_to_configure_default(&mut command);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["-G", "Ninja"]);
+    }
 
     #[test]
     fn cmake_paths_preserve_unix_case_and_backslashes() {

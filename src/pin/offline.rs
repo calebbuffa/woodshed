@@ -1,6 +1,7 @@
 //! Strictly offline metadata/archive adapter for update qualification.
 use super::*;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

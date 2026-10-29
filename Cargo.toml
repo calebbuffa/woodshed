@@ -1,7 +1,7 @@
 [package]
 name = "woodshed"
 description = "Build-script toolkit for vendoring, caching, and building native C/C++ dependencies from source"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -13,8 +13,8 @@ repository = "https://github.com/calebbuffa/woodshed"
 [features]
 default = ["manifest", "download", "tar-gz"]
 
-# Read declarations/locks, with legacy pinned `versions.toml` compatibility.
-manifest = ["dep:toml", "dep:serde"]
+# Read project declarations and immutable locks.
+manifest = ["dep:toml", "dep:serde", "dep:cargo-platform"]
 # Fetch archives over HTTPS.
 download = ["dep:ureq"]
 # Archive formats. Enable only the ones your dependencies actually ship.
@@ -35,12 +35,12 @@ conan = ["package-providers"]
 # Shared native-package installation and generated CMake target discovery.
 package-providers = ["manifest", "cmake", "dep:serde_json", "dep:tempfile", "dep:shlex"]
 pkg-config = ["dep:pkg-config"]
-# Maintain dependency declarations/locks or legacy pins.
+# Resolve and transactionally update dependency declarations and locks.
 pin = ["manifest", "download", "dep:toml_edit", "dep:tempfile", "dep:regex", "dep:serde_json"]
 # Fetch immutable Git source snapshots and inspect upstream dependency metadata.
 git = ["dep:tempfile", "tar-gz"]
 # The `woodshed` command-line tool (`cargo install woodshed --features cli`).
-cli = ["pin", "bundle", "dep:clap"]
+cli = ["pin", "git", "bundle", "build", "dep:clap"]
 # Assemble a Cargo application with declared native runtime resources.
 bundle = ["dep:serde_json", "dep:cargo-config2", "dep:tempfile"]
 
@@ -53,6 +53,7 @@ required-features = ["cli"]
 # Always present: the cache is this crate's reason to exist, and it cannot
 # operate safely without checksums or interprocess locks.
 sha2 = "0.10"
+cargo-platform = { version = "0.3", optional = true }
 serde_json = { version = "1", optional = true }
 cargo-config2 = { version = "0.1", optional = true }
 tempfile = { version = "3", optional = true }

@@ -11,6 +11,7 @@ use std::path::Path;
 /// environments where proxy and TLS trust settings live in the OS
 /// configuration that a bundled client does not see.
 pub fn fetch(url: &str, dest: &Path) -> Result<()> {
+    let _progress = crate::progress::Phase::new(format!("download to {}", dest.display()));
     let mut detail = match fetch_ureq(url, dest) {
         Ok(()) => return Ok(()),
         Err(error) => error,

@@ -42,10 +42,11 @@
 //! ```no_run
 //! # #[cfg(all(feature = "cmake", feature = "manifest"))]
 //! # fn example() -> woodshed::Result<()> {
-//! use woodshed::{BuildKey, Cache, CmakeBuild, Manifest};
+//! use woodshed::{BuildKey, Cache, CmakeBuild, project::Project};
 //!
-//! let manifest = Manifest::load_default(std::env::var("CARGO_MANIFEST_DIR").unwrap())?;
-//! let dep = manifest.get("geos")?;
+//! let project = Project::load("native/woodshed.toml")?;
+//! let lock = project.locked()?;
+//! let dep = &lock.sources["geos"];
 //!
 //! let cache = Cache::discover()?;
 //! let source = cache.source(dep)?;
@@ -73,14 +74,19 @@ mod archive;
 mod bundle;
 mod cache;
 mod dep;
+#[cfg(feature = "package-providers")]
+mod doctor;
 mod error;
 #[cfg(feature = "git")]
 pub mod git;
 mod link;
 pub mod probe;
+pub mod progress;
 mod toolchain;
 #[cfg(feature = "bundle")]
 pub use bundle::bundle_cargo;
+#[cfg(feature = "package-providers")]
+pub use doctor::{DoctorOptions, DoctorReport, doctor, rust_host};
 
 #[cfg(feature = "build")]
 mod build;
@@ -97,7 +103,10 @@ pub mod project;
 #[cfg(any(feature = "pin", feature = "package-providers"))]
 pub mod providers;
 #[cfg(feature = "build")]
-pub use build::{build, build_from};
+pub use build::{
+    ArtifactMetadata, ArtifactSummary, BuildExplanation, BuildOutcome, PruneReport, build,
+    build_from, build_from_with_options,
+};
 #[cfg(feature = "cli")]
 pub mod setup;
 
@@ -112,8 +121,6 @@ pub use toolchain::{Toolchain, find_on_path};
 
 #[cfg(feature = "cmake")]
 pub use cmake::{CmakeBuild, ConfiguredCmakeBuild, MsvcRuntime};
-#[cfg(feature = "manifest")]
-pub use dep::Manifest;
 
 use std::path::Path;
 
@@ -204,6 +211,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// Streams the file, so an archive of any size costs a constant amount of
 /// memory.
 pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let _progress = progress::Phase::new(format!("verify checksum {}", path.display()));
     let actual = sha256_file(path)?;
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
