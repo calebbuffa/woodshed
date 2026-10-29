@@ -29,7 +29,7 @@ Run commands in the application's directory.
 Install the maintenance CLI once:
 
 ```text
-cargo install woodshed --version 0.3.1 --features cli
+cargo install woodshed --version 0.4.0 --features cli
 ```
 
 Then add fmt and select its documented CMake export:
@@ -38,8 +38,7 @@ Then add fmt and select its documented CMake export:
 woodshed add fmt --github fmtlib/fmt --version 11.1.4 --cmake-package fmt --target fmt::fmt --define FMT_TEST=OFF --define FMT_DOC=OFF
 ```
 
-That command creates **both** `woodshed.toml` and `woodshed.lock`. The human
-file contains:
+That command creates **both** `woodshed.toml` and `woodshed.lock`.
 
 ```toml
 [dependencies.fmt]
@@ -68,7 +67,7 @@ build script, add the dependency and call the bridge yourself:
 
 ```toml
 [build-dependencies]
-woodshed = { version = "0.3", features = ["build"] }
+woodshed = { version = "0.4", features = ["build"] }
 ```
 
 Create `build.rs` beside it:
@@ -94,15 +93,6 @@ installation, exported-target link discovery, cache identity, artifact
 completeness checks, and Cargo rerun directives. Subsequent matching builds reuse
 the native installation. You do not list archive filenames or write CMake.
 
-**Updating later is one command:** `woodshed bump fmt <new-version>`.
-Review the changed declarations/lock, then build normally. If the new release
-changes its API or build layout, adjust your binding/build recipe too.
-
-This builds the native dependency; it does not invent a Rust API for a C++
-library. Supply your FFI/native shim or binding generator separately. Libraries
-without installed CMake CONFIG exports use Woodshed's low-level Rust API instead
-of this declarative path.
-
 ## Use vcpkg instead
 
 Choose this when vcpkg already provides the library and you do not want to own
@@ -115,7 +105,7 @@ Other targets need a matching triplet; do not copy `x64-windows` for Linux.
 Install the CLI with the provider enabled, then add the package:
 
 ```text
-cargo install woodshed --version 0.3.1 --features cli,vcpkg
+cargo install woodshed --version 0.4.0 --features cli,vcpkg
 woodshed add zstd --version 1.5.7 --provider vcpkg --triplet x64-windows --cmake-package zstd --target zstd::libzstd_shared --dynamic
 ```
 
@@ -136,7 +126,7 @@ integration, use:
 
 ```toml
 [build-dependencies]
-woodshed = { version = "0.3", features = ["build", "vcpkg"] }
+woodshed = { version = "0.4", features = ["build", "vcpkg"] }
 ```
 
 Use this `build.rs` (no handwritten CMake):
@@ -193,7 +183,7 @@ cmake = { package = "ZLIB", targets = ["ZLIB::ZLIB"], linkage = "static" }
 Lock the declaration using the provider-enabled CLI:
 
 ```text
-cargo install woodshed --version 0.3.1 --features cli,conan
+cargo install woodshed --version 0.4.0 --features cli,conan
 woodshed lock
 ```
 
@@ -202,7 +192,7 @@ use this build dependency:
 
 ```toml
 [build-dependencies]
-woodshed = { version = "0.3", features = ["build", "conan"] }
+woodshed = { version = "0.4", features = ["build", "conan"] }
 ```
 
 Create `build.rs`:
@@ -452,71 +442,6 @@ rejects changed source selectors, dependency IDs, provider selections or profile
 contents. It never invokes a resolver or downloads sources. Normal `woodshed lock`
 explicitly resolves all declarations; ordinary builds never refresh locks.
 
-### Compatible workspaces and immutable source installations
-
-Source recipes build from a private, content-synchronized source snapshot, without
-`.git` metadata, and publish separate immutable installations. By default, different
-source/configuration inputs get isolated workspaces. A package can explicitly opt
-into in-place source edits and a bounded set of CMake reconfigurations:
-
-```toml
-[dependencies.engine.build.workspace]
-name = "development"
-reconfigure = ["ENGINE_ENABLE_SIMD"]
-dependencies = ["codec"]
-```
-
-The options must be declared in that recipe's `defines` or native `features`;
-dependencies must be explicit `depends`/`optional-depends` edges. `name` is only a
-grouping label: manifest identity, dependency ID, pinned source family/path and
-hard configuration namespace the workspace. Target/role, Release configuration,
-generator, linkage/CRT, declared file bytes, compiler/linker environment, selected
-native tools and host prerequisites remain hard inputs. Tool byte changes reset
-the owned build subtree before object reuse. Unrelated manifests/packages cannot
-share a workspace merely by choosing the same label.
-
-Only listed option values and same-role prerequisite identities may vary within
-that boundary; local source contents may change. This authorizes reconfiguration,
-**not** ABI-compatible artifact reuse. Every selected prerequisite identity,
-feature, effective definition and source content identity always remains in the
-exact artifact key. There is no capability union: a cache miss configures precisely
-the requested state. Removed Woodshed-managed definitions, prefix/program paths
-and evaluated `<Package>_DIR` hints are explicitly unset; unrelated upstream cache
-entries are preserved. An absent native feature removes its override, so upstream
-defaults apply unless the base recipe explicitly supplies an off value.
-
-Workspace and artifact locks cover mutation and publication. Sources are checked
-for edits and build-tree writes before publication. CMake configures against the
-final immutable prefix, installs into a private stage, and that complete snapshot
-is renamed into place. Metadata is evaluated at the final prefix before an atomic
-completion receipt makes it reusable. Installed headers/configuration and evaluated
-include/link/tool paths must not reference the mutable source, workspace, stage or
-metadata probe. Safe internal install symlinks are materialized; escaping links,
-cycles and unsupported file types fail. Existing verified prefixes are never
-overwritten; only owned incomplete/corrupt entries are repaired. Recovery refuses
-nonempty unowned directories and cleans only identity-specific owned staging.
-
-Generated headers belong to each exact installation, not the mutable workspace.
-An exact artifact hit avoids reconfiguration; otherwise CMake decides which
-objects remain reusable. This does not promise object reuse when dependency
-include paths, command lines or headers change. SDK/system dependencies outside
-the declared graph still require correct toolchain/environment/input declarations;
-this is not arbitrary ABI inference, runtime-loader closure or a relocatable
-binary-cache format.
-
-Build diagnostics distinguish isolated workspace creation, compatible
-reconfiguration, tool-boundary resets, verified artifact reuse and corruption
-repair. `artifacts/<full-fingerprint>/woodshed-installation.json` records content
-and metadata fingerprints plus per-input field hashes for comparison. Environment
-values are not copied into those receipts. `Installation.cmake_packages` reports
-evaluated CONFIG directories rather than guessed layouts.
-
-`Installation.ownership` is `Artifact` for these source-recipe snapshots,
-`Provider` for vcpkg/Conan installations, and `External` for low-level discovery.
-**Provider prefixes retain provider-owned cache lifetimes; source immutable-
-publication guarantees do not apply to them.** Woodshed does not copy entire
-provider caches or claim uniform provider artifact publication.
-
 ### Understanding rebuilds and managing artifacts
 
 Every successful source build or prebuilt import records its decision in
@@ -636,76 +561,6 @@ to use the same sinks. Consumer-specific superbuild/cache policy must report its
 own decisions; Woodshed cannot infer them. No terminal percentages are invented
 for operations whose total work is unknown.
 
-### Verified prebuilts and local portable packages
-
-Source installations are not automatically portable. Explicitly export a verified
-artifact with `Cache::export_artifact(id, destination, &ArtifactMetadata, toolchain)`
-or `woodshed cache export ID --output package --metadata metadata.json`.
-`ArtifactMetadata` contains `compatibility`, optional `cmake` package/targets,
-and installed `tools`. Compatibility must specify an exact Rust target, a
-publisher-defined nonempty `abi` contract, `configuration = "Release"`, linkage,
-and an MSVC runtime exactly for MSVC targets. The ABI label is an explicit
-publisher/consumer agreement, **not inferred compiler compatibility or proof of ABI**.
-
-Export verifies the original target/configuration/linkage/CRT receipt, scans all
-files for embedded old-prefix references (including UTF-16), and evaluates the
-installed exports at a different prefix. External installation references fail:
-the initial portable format is deliberately self-contained, not a way to export
-an arbitrary dependent artifact graph. Cross-target metadata evaluation requires
-an explicit toolchain. Generated headers/configs and binaries must support
-relocation; Woodshed does not rewrite binaries or CMake files to hide bad exports.
-
-Export atomically creates a new package directory containing `prefix/` and
-`woodshed-artifact.json`. Its versioned descriptor records compatibility, export
-intent, every directory and file hash, and executable modes, using UTF-8 paths
-with platform-independent separators. Unix imports check executable modes;
-Windows verifies content and entry types because it cannot represent Unix mode
-bits. Read/write permissions and other host-specific metadata are not portable
-package identity. Metadata evaluation must not modify the exported installation.
-Safe installation links have already been materialized in source snapshots.
-Existing export destinations are never overwritten.
-
-Consume a local exported package without compiling its source:
-
-```toml
-[dependencies.codec]
-path = "packages/codec"
-prebuilt = { target = "x86_64-pc-windows-msvc", abi = "publisher-c-api-v1", configuration = "Release", linkage = "static", msvc-runtime = "dynamic" }
-```
-
-For distribution, archive the complete package **as one top-level directory**,
-preserving executable permissions. Replace `path` with explicit `url` / `version`
-fields and generate a lock; its archive checksum protects the published bytes.
-Do not infer target/ABI from the archive filename. The embedded compatibility
-must exactly match the manifest, the complete inventory must verify, and metadata
-is re-evaluated at the final immutable imported prefix. There is no silent source
-fallback, source reconfiguration, or network refresh during an ordinary build.
-Selected native features require a different explicit prebuilt selection.
-
-A cross-target package with CMake exports can supply a `build` metadata recipe
-with matching package/targets/linkage and explicit `toolchain`; it cannot contain
-source reconfiguration options. Tool-only packages declare their installed `bin`
-names in the descriptor. Imported installations use the same content-verified,
-locked source-artifact publication and retention protections as compiled recipes.
-Integrity verifies selected bytes, not publisher trust; imported CMake exports,
-like source recipes, are trusted build code. Dynamic system-loader compatibility
-remains part of the explicit ABI/platform contract.
-
-CI runs the real C/C++ graph, static/shared linking, artifact, source and recovery
-fixtures on Windows, Linux and macOS, with a Rust 1.89 check. A configured CI matrix
-is not evidence that an unexecuted platform has passed on this machine.
-
-**Still outside this implementation:** immutable publication for provider-owned
-prefixes and native remote binary-cache storage/services. No provider cache
-copying or implicit remote service is introduced.
-
-The rest of this guide is reference material. Start here only when the recipes
-above do not cover your integration:
-[source selection](#dependency-intent-not-checksum-bookkeeping),
-[upstream CMake pins](#follow-a-dependency-declared-in-upstream-cmake),
-[provider details](#native-package-providers-no-handwritten-consumer-cmake),
-[CRT choices](#the-crt-problem), and [application packaging](#application-bundles).
-
 ## Reference: optional building blocks
 
 Every piece is independently useful and independently optional, gated behind its
@@ -749,31 +604,6 @@ executable together with the files in the library's `DEP_<LINKS>_LIBDIR` / `_BIN
 copy them with `copy_shared_libs`. Link arguments from a dependency's build script never
 reach the application's executable, so a library crate cannot do this for you.
 
-### Inspect CMake configuration before compiling
-
-`CmakeBuild::configure()` returns a `ConfiguredCmakeBuild` after a successful
-configure step, without building native targets. Inspect generated headers,
-`CMakeCache.txt`, or requested CMake File API replies through
-`build_directory()`, then call `build()` to continue. `install()` remains the
-configure-and-build convenience method. Keep the `BuildDirs::lock()` guard
-alive across both phases; configuration alone is not artifact completeness.
-
-This separation supports maintainer binding generation and metadata discovery
-without first compiling a complete native compiler/toolchain. It does not
-guess dependency versions or fetch unpinned upstream dependencies.
-
-`Toolchain::detect()` respects an explicit `CMAKE_GENERATOR`. Reuse checks
-canonicalize source directories and recognize Windows verbatim/UNC spellings
-without discarding Unix path case sensitivity.
-
-Detected sccache/ccache launchers now apply to **both C and C++** by default.
-`CmakeBuild::compiler_launcher_define("CMAKE_C_COMPILER_LAUNCHER")` selects
-only C; passing `CMAKE_CXX_COMPILER_LAUNCHER` selects only C++, and a custom
-variable selects only that variable. At the lower level,
-`Toolchain::apply_to_configure_default` configures both languages while
-`apply_to_configure(command, variable)` retains its single-variable behavior.
-No launcher flags are emitted when no compiler cache is detected.
-
 ### Stable mirrors and additive source workspaces
 
 `Cache::mirror(source, key)` synchronizes the existing `mirrors/<key>` path
@@ -806,29 +636,6 @@ path or recopy patched root files. Omitted mounts remain installed.
 an existing directory **without recopying it**, or copies the source if the
 destination does not exist. This lets callers add dependencies to existing trees
 without changing CMake's stored source path.
-
-Both APIs record canonical source and dependency paths as pinned identities.
-Callers must keep those input paths immutable and mix the pinned root identity
-into the key; Woodshed does not hash entire dependency trees. Dependencies
-use Unix symlinks or Windows junctions and must not be modified by builds.
-Different recorded identities, duplicate/overlapping/escaping mount paths,
-linked mount ancestors, and conflicting links/files/nonempty directories
-fail explicitly. Empty submodule placeholders can become mounts.
-Identity state lives in a sibling `<destination>.incremental` directory; keep
-it with the root. State updates are atomic, interrupted copies are retried,
-and missing recorded mounts are restored on reuse.
-
-Mirror refreshes and prepared-source operations have sibling interprocess
-locks. Callers must still hold their build/workspace locks while builds read
-these shared trees; the source operation lock covers synchronization, not the
-whole native build.
-
-Returned mirror and incremental prepared-source paths preserve the caller's
-absolute destination spelling (relative destinations are made absolute).
-Canonicalization is internal to identity, locking, and safety checks: it does
-not resolve parent-directory aliases or add Windows `\\?\` prefixes to returned
-build-facing paths. This keeps CMake source paths and compiler command lines
-stable; callers supplying verbatim paths explicitly retain that spelling.
 
 ### Maintaining dependencies
 
@@ -984,136 +791,6 @@ Direct bumps of managed children fail; bump their parent instead.
 Woodshed does **not** infer arbitrary CMake dependency graphs or choose build
 targets. Projects own their source-build mappings and build integration.
 
-### Native package providers: no handwritten consumer CMake
-
-Opt in to a provider instead of a source recipe. These are **explicit installs**,
-not the older best-effort probes and not a fallback if another provider fails:
-
-```toml
-[dependencies.zstd]
-provider = "vcpkg"
-package = "zstd"
-version = "1.5.7"
-triplet = "x64-windows"
-[dependencies.zstd.cmake]
-package = "zstd"
-targets = ["zstd::libzstd_shared"]
-linkage = "dynamic"
-
-[dependencies.openssl]
-provider = "conan"
-package = "openssl/3.4.1"
-host-profile = "profiles/host"
-build-profile = "profiles/build"
-options = ["openssl/*:shared=False"]
-build-missing = true
-[dependencies.openssl.cmake]
-package = "OpenSSL"
-targets = ["OpenSSL::SSL", "OpenSSL::Crypto"]
-```
-
-Enable `vcpkg`/`conan` in the build dependency and maintenance CLI as needed:
-
-```text
-cargo install woodshed --features cli,vcpkg,conan
-woodshed add zstd --version 1.5.7 --provider vcpkg --triplet x64-windows --cmake-package zstd --target zstd::libzstd_shared --dynamic
-```
-
-For builds, `providers::install` takes the declaration path, dependency name, and
-`InstallOptions::cargo(name)` (or explicit target/configuration/output options).
-It returns `Installation`: include directories, definitions, native compile flags,
-ordered linker arguments, and runtime directories. `emit_cargo()` validates the
-entire link set before emitting propagating `rustc-link-lib`/search directives.
-Unsupported custom linker flags fail explicitly; applications needing them can
-consume the complete ordered `link_arguments` at the final linker instead.
-Runtime deployment remains explicit: package runtime directories are not silently
-added to a process-global loader path or copied into a distribution.
-
-Woodshed generates a small CMake consumer and queries its File API to evaluate
-exported transitive targets. Users supply the package/target names documented by
-the package, not CMake source. CMake CONFIG exports are required in this initial
-adapter; module-only packages need their own integration. A native SDK and CMake
-3.21+ are still prerequisites.
-
-vcpkg requires an existing `VCPKG_ROOT`. Locking captures its current immutable
-registry baseline (or the declaration's explicit `baseline`), exact version
-override, features, and tool/root identity; installation uses a separate manifest
-and install tree without modifying the shared installation. Triplet architecture,
-platform, and MSVC CRT must agree with the Cargo target. Port defaults can be
-disabled with `default-features = false`; `features` lists optional port features.
-The adapter accepts standard MSVC Windows, glibc Linux, and macOS triplets
-(including Windows `-static`/`-static-md` variants). GNU Windows, musl, and custom
-triplet ABIs are not inferred and fail explicitly.
-
-Conan requires an existing Conan 2 CLI (`CONAN` can select its executable).
-Woodshed invokes Conan's own lock/install commands and CMakeDeps/CMakeToolchain,
-and writes no Python recipe or generator. Explicit host/build profile contents
-are fingerprinted: missing or changed profiles fail before installation. Profiles
-must be self-contained (flatten includes/Jinja before locking). Conan's recipe
-revisions/graph and tool version are locked; Conan retains responsibility for
-binary package IDs, compiler compatibility, and its own caches. Host architecture,
-OS, and MSVC runtime are checked against the requested Rust target.
-
-`WOODSHED_OFFLINE=1` forbids resolving a new provider lock. Installation delegates
-offline restrictions to vcpkg `--no-downloads` or Conan `--no-remote`, and errors if
-their caches are insufficient. This is not a network sandbox for arbitrary
-third-party recipes.
-
-#### Library and offline use
-
-`project::plan_add` accepts a `Dependency` and a `pin::Resolver`;
-`project::plan_bump` accepts a `pin::Selection` and a resolver.
-Inspect `Update::{changes,manifest,lock}` before calling `Update::apply()`.
-`Project::load(path)?.locked()?` reads the generated lock. Embedded callers use
-`Project::parse(path, declarations)?.parse_lock(lock_text)?`; both return the same
-`project::Lock`, with immutable source records in `lock.sources`. Embedded parsing
-validates declarations and source identities but does not read provider profiles.
-There is one persisted project model: `woodshed.toml` plus `woodshed.lock`, with
-no combined-pin format, fallback discovery or separate manifest/updater API.
-`pin::Online` supplies host-Git metadata and archive downloads.
-`pin::Offline::load` reads strict JSON fixtures without network fallback:
-
-```json
-{
-    "refs": [
-        {
-            "repository": "https://example.org/parent.git",
-            "reference": "v1.3.0",
-            "revision": "0123456789abcdef0123456789abcdef01234567"
-        }
-    ],
-    "files": [
-        {
-            "repository": "https://example.org/parent.git",
-            "revision": "0123456789abcdef0123456789abcdef01234567",
-            "path": "pins.txt",
-            "file": "pins.txt"
-        }
-    ],
-    "gitlinks": [
-        {
-            "repository": "https://example.org/parent.git",
-            "revision": "0123456789abcdef0123456789abcdef01234567",
-            "path": "third_party/child",
-            "source": {
-                "repository": "https://example.org/child.git",
-                "revision": "123456789abcdef0123456789abcdef012345678"
-            }
-        }
-    ],
-    "archives": [
-        { "name": "parent", "file": "parent.archive" },
-        { "name": "child", "file": "child.archive" }
-    ]
-}
-```
-
-File references are relative to the JSON directory and must remain inside it.
-Archive bytes are hashed, not trusted checksum sidecars. Each metadata lookup
-must have exactly one match. Implement `Resolver` for another authenticated
-metadata service or a project's semantic checks; the planner still owns
-traversal, immutable pin validation, and the transaction.
-
 ## The one opinion
 
 **Expensive build trees go in a content-hashed cache directory, never
@@ -1144,43 +821,6 @@ on is your decision:
 
 Only you know which is true of your library, so woodshed asks rather than
 guessing.
-
-## Application bundles
-
-Enable `bundle` to use `woodshed::bundle_cargo`, or `cli` for:
-
-```text
-woodshed bundle --output dist -- --manifest-path app/Cargo.toml --bin app --release
-```
-
-The destination must be new. This builds one executable with `cargo rustc`,
-adds an executable-relative rpath on Linux/macOS, and copies native deployment
-trees declared by build scripts:
-
-```rust,ignore
-println!("cargo:rustc-env=WOODSHED_DEPLOYMENT_DIR={}", runtime_directory.display());
-```
-
-The bundler discovers these declarations through Cargo's JSON build messages,
-including transitive dependencies. Native integrations must populate the
-directory with all required redistributable libraries, helpers, and resources
-in their executable-relative layout. Build-only archives/import libraries do
-not belong there. The tool does not infer missing native dependencies or
-redistribution permissions.
-
-Select exactly one executable with `--bin` or `--example`. Target selection
-respects `--target`, `CARGO_BUILD_TARGET`, and Cargo's configuration hierarchy
-from the invocation directory (not the `--manifest-path` directory), in that
-order. Multi-target builds and CLI `--config` overrides fail explicitly; use
-configuration files or Cargo environment variables instead.
-
-Identical resource files from multiple dependencies are shared; conflicting
-contents, file/directory collisions, and missing directories fail explicitly.
-Files are staged in a temporary sibling directory and renamed into place only
-on success. Ordinary failures clean up staging without leaving a partial
-destination. An interrupted process may leave a `.woodshed-bundle-*` staging
-directory, never a ready-looking output directory. Run cross-built bundles on
-their destination platform.
 
 ## Environment
 
