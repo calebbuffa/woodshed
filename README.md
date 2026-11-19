@@ -29,7 +29,7 @@ Run commands in the application's directory.
 Install the maintenance CLI once:
 
 ```text
-cargo install woodshed --version 0.4.0 --features cli
+cargo install woodshed --version 0.4.1 --features cli
 ```
 
 Then add fmt and select its documented CMake export:
@@ -105,7 +105,7 @@ Other targets need a matching triplet; do not copy `x64-windows` for Linux.
 Install the CLI with the provider enabled, then add the package:
 
 ```text
-cargo install woodshed --version 0.4.0 --features cli,vcpkg
+cargo install woodshed --version 0.4.1 --features cli,vcpkg
 woodshed add zstd --version 1.5.7 --provider vcpkg --triplet x64-windows --cmake-package zstd --target zstd::libzstd_shared --dynamic
 ```
 
@@ -183,7 +183,7 @@ cmake = { package = "ZLIB", targets = ["ZLIB::ZLIB"], linkage = "static" }
 Lock the declaration using the provider-enabled CLI:
 
 ```text
-cargo install woodshed --version 0.4.0 --features cli,conan
+cargo install woodshed --version 0.4.1 --features cli,conan
 woodshed lock
 ```
 
@@ -604,7 +604,7 @@ executable together with the files in the library's `DEP_<LINKS>_LIBDIR` / `_BIN
 copy them with `copy_shared_libs`. Link arguments from a dependency's build script never
 reach the application's executable, so a library crate cannot do this for you.
 
-### Stable mirrors and additive source workspaces
+### Stable mirrors and source workspaces
 
 `Cache::mirror(source, key)` synchronizes the existing `mirrors/<key>` path
 by file content instead of deleting and recopying it. Unchanged files retain
@@ -636,6 +636,34 @@ path or recopy patched root files. Omitted mounts remain installed.
 an existing directory **without recopying it**, or copies the source if the
 destination does not exist. This lets callers add dependencies to existing trees
 without changing CMake's stored source path.
+
+For incremental builds **across source revisions**, use
+`Cache::refresh_sources_to(source, destination, mounts)` instead. It synchronizes
+the exact root and dependency set into an exclusively owned, stable path.
+Unchanged file contents retain timestamps, changed files get fresh timestamps,
+and removed files and omitted mounts disappear. Local patches and generated
+source-tree files are not preserved. Do not mix this with additive preparation
+on the same destination.
+Symlinks in the root source and refreshed dependency mounts are preserved
+verbatim, including dangling relative links, rather than followed like
+`mirror_to`. On Windows this requires Developer Mode or symlink creation
+privileges; failure reports the source and destination.
+
+Existing dependency symlinks/junctions pointing to the requested immutable
+source are preserved, so an IREE-only patch does not recopy or retimestamp an
+unchanged LLVM mount. New mounts link to immutable inputs. A changed link is
+materialized as a private mirror, conservatively invalidating that dependency
+on its first revision change; subsequent refreshes preserve unchanged files.
+Source caches are never modified through destination links.
+
+Keep the mutable workspace key independent of source revisions, but include
+toolchain, target and incompatible configuration boundaries. Keep **all exact
+source identities** in the separate installed-artifact key. Hold the workspace
+lock through source refresh, configure, compilation and installation; internal
+preparation locks alone do not protect running compilers. Artifacts must retain
+their own immutable headers/metadata rather than refer to the mutable source
+tree. CMake/Ninja determine dirty objects after reconfiguration; workspace reuse
+does not guarantee that any particular source change avoids a rebuild.
 
 ### Maintaining dependencies
 
@@ -723,7 +751,8 @@ markers = ["CMakeLists.txt"]
 automatic submodule initialization. Cache and build identities include the
 repository and immutable commit. Completed snapshots work offline; missing or
 incomplete snapshots fail explicitly. Enable `git` in the consuming build
-dependency only when it needs Git sources. Extracted archives live under `sources/archive-<sha256>`,
+dependency only when it needs Git sources. Extracted archives and Git checkouts
+both live under `sources`,
 so different locked bytes never share a tree just because name/version labels
 match. No previous directories are scanned or adopted. Completed Git and archive
 trees have full content/type/permission fingerprints; modifying cached inputs is
@@ -733,6 +762,17 @@ recorded under a lock; missing/modified content is restored from a verified cach
 archive, including offline. A valid extracted tree can be reused without keeping
 its downloaded archive. A damaged Git snapshot requires repopulating its exact
 commit with network/repository access; ordinary builds never resolve moving refs.
+
+Framed build keys and tree fingerprints are a cache identity change, not a
+Woodshed release-number change. Old build and extraction receipts are not
+promoted. Existing checksum-verified archives are reused, including offline;
+Git exports must be recreated from their locked commits if no current entry
+exists. The inventory format is part of each source entry's key, so old
+entries under `sources` are left untouched. If you need to
+export from an old local installation receipt, rebuild the installation and
+export it again. Already exported portable packages use an independent
+path/type/file-checksum inventory and remain compatible. Dependency locks and
+archive checksums do not change.
 
 GitHub source archives retain Git provenance in the generated lock for dependency discovery:
 

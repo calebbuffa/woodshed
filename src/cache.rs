@@ -33,8 +33,10 @@ mod tree;
 pub(crate) use tree::snapshot_fingerprint;
 pub(crate) use tree::tree_fingerprint;
 
+pub(crate) const SOURCE_INVENTORY: &str = "woodshed-source-inventory";
+
 fn source_record(identity: &str, fingerprint: &str) -> String {
-    format!("woodshed-source-v1\n{identity}\n{fingerprint}\n")
+    format!("{SOURCE_INVENTORY}\n{identity}\n{fingerprint}\n")
 }
 
 fn verified_source_tree(root: &Path, record: &Path, identity: &str) -> Result<bool> {
@@ -43,6 +45,12 @@ fn verified_source_tree(root: &Path, record: &Path, identity: &str) -> Result<bo
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(Error::io("read extracted source inventory", error)),
     };
+    if !text
+        .strip_prefix(SOURCE_INVENTORY.as_bytes())
+        .is_some_and(|remaining| remaining.starts_with(b"\n"))
+    {
+        return Ok(false);
+    }
     Ok(text == source_record(identity, &tree_fingerprint(root)?).as_bytes())
 }
 
@@ -297,22 +305,36 @@ impl Cache {
 
     #[cfg(feature = "download")]
     fn download_verified(&self, dep: &Dep, path: &Path) -> Result<PathBuf> {
-        let partial = path.with_extension(format!("partial-{}", std::process::id()));
         eprintln!(
             "woodshed: downloading {} {} from {}",
             dep.name, dep.version, dep.url
         );
+        Self::stage_archive(path, &dep.sha256, |partial| {
+            crate::download::fetch(&dep.url, partial)
+        })
+    }
 
-        let cleanup = |error| {
-            let _ = fs::remove_file(&partial);
-            error
-        };
-        crate::download::fetch(&dep.url, &partial).map_err(cleanup)?;
-        crate::verify_sha256(&partial, &dep.sha256).map_err(cleanup)?;
-        fs::rename(&partial, path).map_err(|error| {
-            let _ = fs::remove_file(&partial);
-            Error::io(format!("cannot move into {}", path.display()), error)
+    #[cfg(feature = "download")]
+    fn stage_archive(
+        path: &Path,
+        checksum: &str,
+        fetch: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<PathBuf> {
+        let parent = path.parent().ok_or_else(|| {
+            Error::io(
+                format!("stage archive {}", path.display()),
+                std::io::Error::other("archive path has no parent"),
+            )
         })?;
+        let stage = tempfile::Builder::new()
+            .prefix(".woodshed-download-")
+            .tempdir_in(parent)
+            .map_err(|error| Error::io(format!("stage archive {}", path.display()), error))?;
+        let partial = stage.path().join("archive");
+        fetch(&partial)?;
+        crate::verify_sha256(&partial, checksum)?;
+        fs::rename(&partial, path)
+            .map_err(|error| Error::io(format!("cannot move into {}", path.display()), error))?;
         Ok(path.to_path_buf())
     }
 
@@ -535,7 +557,105 @@ impl Cache {
             &root,
             &mut std::collections::BTreeSet::new(),
             ignore,
+            &[],
+            false,
         )?;
+        Ok(output)
+    }
+
+    /// Refresh an exclusively owned source tree at a stable build-facing path.
+    ///
+    /// Unlike [`Self::prepare_incremental_to`], this synchronizes the exact
+    /// requested root and mount set across source revisions. Changed files get
+    /// fresh timestamps; unchanged contents retain theirs. Removed files and
+    /// omitted mounts are removed without traversing destination links. Source
+    /// symlinks in the root and refreshed mounts are preserved verbatim,
+    /// including dangling relative links;
+    /// Windows requires Developer Mode or symlink creation privileges.
+    ///
+    /// Unchanged dependency links (including existing prepared-tree junctions)
+    /// remain intact. New mounts link to immutable inputs. A changed link is
+    /// replaced by a private, content-synchronized directory, conservatively
+    /// invalidating that dependency on its first revision change.
+    ///
+    /// This does not preserve local patches or generated files in the tree.
+    /// Callers must hold their build/workspace lock for refresh and all readers;
+    /// the internal prepare lock serializes source preparation only. Do not mix
+    /// additive preparation and refreshing on the same destination.
+    pub fn refresh_sources_to(
+        &self,
+        source: &Path,
+        destination: &Path,
+        mounts: &[(PathBuf, PathBuf)],
+    ) -> Result<PathBuf> {
+        let output = std::path::absolute(destination)
+            .map_err(|error| Error::io("cannot resolve refresh destination", error))?;
+        let (source, destination) = source_destination(source, destination)?;
+        let mounts = resolve_mounts(mounts)?;
+        let _lock = Lock::acquire(&lock_path(&destination, "prepare"))?;
+        for (relative, target) in &mounts {
+            if target.starts_with(&destination) || destination.starts_with(target) {
+                return Err(source_conflict(
+                    "source mount overlaps refreshed root",
+                    relative,
+                ));
+            }
+            let mut parent = destination.clone();
+            for component in relative.parent().into_iter().flat_map(Path::components) {
+                parent.push(component);
+                if path_metadata(&parent)?.is_some_and(|meta| is_link(&meta) || !meta.is_dir()) {
+                    return Err(source_conflict(
+                        "source mount ancestor is not a real directory",
+                        &parent,
+                    ));
+                }
+            }
+        }
+        let protected = mounts
+            .iter()
+            .map(|(relative, _)| destination.join(relative))
+            .collect::<Vec<_>>();
+        sync_dir(
+            &source,
+            &destination,
+            &destination,
+            &mut std::collections::BTreeSet::new(),
+            |_| false,
+            &protected,
+            true,
+        )?;
+        for (relative, target) in &mounts {
+            let mount = destination.join(relative);
+            match path_metadata(&mount)? {
+                Some(meta) if is_link(&meta) => {
+                    if mount
+                        .canonicalize()
+                        .map_err(|error| Error::io("cannot resolve existing source mount", error))?
+                        == *target
+                    {
+                        continue;
+                    }
+                    remove_entry(&mount, &meta)?;
+                }
+                Some(meta) if !meta.is_dir() => {
+                    remove_entry(&mount, &meta)?;
+                }
+                Some(_) => {}
+                None => {
+                    install_mount(&destination, relative, target)?;
+                    continue;
+                }
+            }
+            sync_dir(
+                target,
+                &mount,
+                &mount,
+                &mut std::collections::BTreeSet::new(),
+                |_| false,
+                &[],
+                true,
+            )?;
+        }
         Ok(output)
     }
 
@@ -1063,6 +1183,8 @@ fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
         &root,
         &mut std::collections::BTreeSet::new(),
         |_| false,
+        &[],
+        false,
     )
 }
 
@@ -1072,10 +1194,11 @@ fn sync_dir(
     root: &Path,
     ancestors: &mut std::collections::BTreeSet<PathBuf>,
     ignore: fn(&std::ffi::OsStr) -> bool,
+    protected: &[PathBuf],
+    preserve_links: bool,
 ) -> Result<()> {
-    let resolved = source
-        .canonicalize()
-        .map_err(|error| Error::io("cannot resolve mirror source directory", error))?;
+    let has_mounts = contains_mount(protected, dest);
+    let resolved = resolve_path(source)?;
     if resolved.starts_with(root)
         || root.starts_with(&resolved)
         || !ancestors.insert(resolved.clone())
@@ -1093,20 +1216,73 @@ fn sync_dir(
     fs::create_dir_all(dest)
         .map_err(|error| Error::io(format!("cannot create {}", dest.display()), error))?;
 
-    let entries = fs::read_dir(source)
-        .map_err(|error| Error::io(format!("cannot read {}", source.display()), error))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| Error::io(format!("cannot read {}", source.display()), error))?;
-        if ignore(&entry.file_name()) {
+    let mut names = std::collections::BTreeSet::new();
+    match fs::read_dir(source) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| Error::io("cannot read mirror source entry", error))?;
+                names.insert(entry.file_name());
+            }
+        }
+        Err(error) if has_mounts && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::io(
+                format!("cannot read {}", source.display()),
+                error,
+            ));
+        }
+    }
+    for path in protected {
+        if let Ok(relative) = path.strip_prefix(dest)
+            && let Some(component) = relative.components().next()
+        {
+            names.insert(component.as_os_str().to_owned());
+        }
+    }
+    for name in names {
+        if ignore(&name) {
             continue;
         }
-        let path = entry.path();
-        let target = dest.join(entry.file_name());
+        let path = source.join(&name);
+        let target = dest.join(name);
+        if protected
+            .iter()
+            .any(|path| mount_path(path) == mount_path(&target))
+        {
+            continue;
+        }
+        let mount_ancestor = contains_mount(protected, &target);
+        let metadata = path_metadata(&path)?;
 
-        if path.is_dir() {
-            sync_dir(&path, &target, root, ancestors, ignore)?;
+        if mount_ancestor
+            && metadata
+                .as_ref()
+                .is_some_and(|meta| is_link(meta) || !meta.is_dir())
+        {
+            return Err(source_conflict(
+                "source mount ancestor is not a real directory",
+                &path,
+            ));
+        }
+        if preserve_links
+            && metadata
+                .as_ref()
+                .is_some_and(|meta| meta.file_type().is_symlink())
+        {
+            sync_source_link(&path, &target)?;
+            continue;
+        }
+        if path.is_dir() || mount_ancestor {
+            sync_dir(
+                &path,
+                &target,
+                root,
+                ancestors,
+                ignore,
+                protected,
+                preserve_links,
+            )?;
         } else {
             if let Some(meta) = path_metadata(&target)? {
                 if is_link(&meta) || !meta.is_file() {
@@ -1150,6 +1326,10 @@ fn sync_dir(
         fs::read_dir(dest).map_err(|error| Error::io("cannot read mirror destination", error))?
     {
         let entry = entry.map_err(|error| Error::io("cannot read mirror entry", error))?;
+        let target = entry.path();
+        if contains_mount(protected, &target) {
+            continue;
+        }
         if ignore(&entry.file_name()) || path_metadata(&source.join(entry.file_name()))?.is_none() {
             let meta = fs::symlink_metadata(entry.path())
                 .map_err(|error| Error::io("cannot inspect obsolete mirror entry", error))?;
@@ -1158,6 +1338,53 @@ fn sync_dir(
     }
     ancestors.remove(&resolved);
     Ok(())
+}
+
+fn sync_source_link(source: &Path, destination: &Path) -> Result<()> {
+    let link = fs::read_link(source).map_err(|error| {
+        Error::io(
+            format!("cannot read source link {}", source.display()),
+            error,
+        )
+    })?;
+    if let Some(meta) = path_metadata(destination)? {
+        if meta.file_type().is_symlink()
+            && fs::read_link(destination)
+                .map_err(|error| Error::io("cannot read destination link", error))?
+                == link
+        {
+            return Ok(());
+        }
+        remove_entry(destination, &meta)?;
+    }
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(&link, destination);
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::fs::FileTypeExt;
+        let kind = fs::symlink_metadata(source)
+            .map_err(|error| Error::io("cannot inspect source link", error))?
+            .file_type();
+        if kind.is_symlink_dir() {
+            std::os::windows::fs::symlink_dir(&link, destination)
+        } else {
+            std::os::windows::fs::symlink_file(&link, destination)
+        }
+    };
+    #[cfg(not(any(windows, unix)))]
+    let result = Err(std::io::Error::other(
+        "source symlinks require Unix or Windows",
+    ));
+    result.map_err(|error| Error::io(
+        format!("cannot preserve source link {} -> {} at {}; Windows requires Developer Mode or symlink privileges",
+            source.display(), link.display(), destination.display()), error))
+}
+
+fn contains_mount(mounts: &[PathBuf], path: &Path) -> bool {
+    let path = mount_path(path);
+    mounts
+        .iter()
+        .any(|mount| mount_path(mount).starts_with(&path))
 }
 
 pub(crate) fn remove_entry(path: &Path, meta: &fs::Metadata) -> Result<()> {
@@ -1263,20 +1490,11 @@ pub struct BuildKey {
 impl BuildKey {
     /// Start a key for a named build, seeded with the target triple.
     pub fn new(label: impl Into<String>) -> Self {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(env::var("TARGET").unwrap_or_default().as_bytes());
-        hasher.update(
-            env::var("CARGO_CFG_TARGET_ENV")
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        hasher.update(env::var("CC").unwrap_or_default().as_bytes());
-        hasher.update(env::var("CXX").unwrap_or_default().as_bytes());
-        Self {
-            hasher,
-            label: label.into(),
-        }
+        Self::start(label.into(), b"cargo")
+            .mix(env::var("TARGET").unwrap_or_default())
+            .mix(env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default())
+            .mix(env::var("CC").unwrap_or_default())
+            .mix(env::var("CXX").unwrap_or_default())
     }
 
     /// Start an explicit identity without implicit process-environment inputs.
@@ -1284,11 +1502,16 @@ impl BuildKey {
     /// The caller must supply every relevant input. Declarative orchestration
     /// uses structured identities rather than inheriting Cargo's target for host tools.
     pub fn explicit(label: impl Into<String>) -> Self {
+        Self::start(label.into(), b"explicit")
+    }
+
+    fn start(label: String, kind: &[u8]) -> Self {
         use sha2::Digest;
-        Self {
-            hasher: sha2::Sha256::new(),
-            label: label.into(),
-        }
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"woodshed-build-key-framed\0");
+        hash_field(&mut hasher, kind);
+        hash_field(&mut hasher, label.as_bytes());
+        Self { hasher, label }
     }
 
     /// Mix in a dependency's pinned identity.
@@ -1301,7 +1524,7 @@ impl BuildKey {
                 .mix(&git.repository)
                 .mix(&git.revision);
         }
-        self.mix(dep.version.as_bytes()).mix(dep.sha256.as_bytes())
+        self.mix("archive").mix(&dep.version).mix(&dep.sha256)
     }
 
     /// Fold the linkage, and the install rpath it implies, into the key, so a
@@ -1316,31 +1539,26 @@ impl BuildKey {
     /// Mix in arbitrary bytes.
     #[must_use]
     pub fn mix(mut self, bytes: impl AsRef<[u8]>) -> Self {
-        use sha2::Digest;
-        self.hasher.update(bytes.as_ref());
+        hash_field(&mut self.hasher, bytes.as_ref());
         self
     }
 
     /// The directory name for this key: the label plus a short digest.
     pub fn as_str(&self) -> String {
-        use sha2::Digest;
-        let digest = self.hasher.clone().finalize();
-        let hex: String = digest[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        format!("{}-{hex}", self.label)
+        format!("{}-{}", self.label, &self.fingerprint()[..16])
     }
 
     /// Full SHA-256 identity for immutable artifacts and hard workspace boundaries.
     pub fn fingerprint(&self) -> String {
         use sha2::Digest;
-        let mut hash = self.hasher.clone();
-        hash.update(b"\0woodshed-label\0");
-        hash.update((self.label.len() as u64).to_le_bytes());
-        hash.update(self.label.as_bytes());
-        format!("{:x}", hash.finalize())
+        format!("{:x}", self.hasher.clone().finalize())
     }
+}
+
+pub(crate) fn hash_field(hash: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
 }
 
 /// Resolve the project root of an extracted tree.
@@ -1472,6 +1690,187 @@ impl Drop for Lock {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(all(feature = "git", any(windows, unix)))]
+    fn refresh_preserves_dangling_relative_links()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        let destination = root.path().join("prepared");
+        fs::create_dir_all(&source)?;
+        let link = source.join("ghost.svg");
+        let relative = Path::new("../../../missing/image.svg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(relative, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(relative, &link)?;
+        let cache = Cache::at(root.path().join("cache"));
+        cache.refresh_sources_to(&source, &destination, &[])?;
+        let copied = destination.join("ghost.svg");
+        assert_eq!(fs::read_link(&copied)?, relative);
+        let timestamp = fs::symlink_metadata(&copied)?.modified()?;
+        cache.refresh_sources_to(&source, &destination, &[])?;
+        assert_eq!(fs::symlink_metadata(&copied)?.modified()?, timestamp);
+        fs::remove_file(link)?;
+        cache.refresh_sources_to(&source, &destination, &[])?;
+        assert!(path_metadata(&copied)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "git", any(windows, unix)))]
+    fn refresh_preserves_unchanged_root_files_and_legacy_mounts()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let dep = root.path().join("dependency");
+        for source in [&first, &second] {
+            fs::create_dir_all(source)?;
+            fs::write(source.join("same.h"), b"same")?;
+        }
+        fs::write(first.join("changed.h"), b"old")?;
+        fs::write(first.join("removed.h"), b"obsolete")?;
+        fs::write(second.join("changed.h"), b"new")?;
+        fs::create_dir_all(&dep)?;
+        fs::write(dep.join("library.h"), b"dependency")?;
+        let cache = Cache::at(root.path().join("cache"));
+        let mounts = [(PathBuf::from("third_party/library"), dep.clone())];
+        let prepared = cache.prepare_incremental(&BuildKey::explicit("old"), &first, &mounts)?;
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(946684800);
+        for file in [
+            prepared.join("same.h"),
+            prepared.join("changed.h"),
+            second.join("changed.h"),
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(file)?
+                .set_modified(old)?;
+        }
+        let dep_time = fs::metadata(dep.join("library.h"))?.modified()?;
+        assert_eq!(
+            cache.refresh_sources_to(&second, &prepared, &mounts)?,
+            prepared
+        );
+        assert_eq!(fs::metadata(prepared.join("same.h"))?.modified()?, old);
+        assert_ne!(fs::metadata(prepared.join("changed.h"))?.modified()?, old);
+        assert_eq!(fs::read(prepared.join("changed.h"))?, b"new");
+        assert!(!prepared.join("removed.h").exists());
+        assert!(is_link(&fs::symlink_metadata(
+            prepared.join("third_party/library")
+        )?));
+        assert_eq!(fs::metadata(dep.join("library.h"))?.modified()?, dep_time);
+        assert_eq!(fs::read(first.join("changed.h"))?, b"old");
+        let updated = fs::metadata(prepared.join("changed.h"))?.modified()?;
+        cache.refresh_sources_to(&second, &prepared, &mounts)?;
+        assert_eq!(
+            fs::metadata(prepared.join("changed.h"))?.modified()?,
+            updated
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "git", any(windows, unix)))]
+    fn refresh_replaces_and_removes_mounts_without_mutating_inputs()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for path in [&source, &first, &second] {
+            fs::create_dir_all(path)?;
+        }
+        fs::write(first.join("library.h"), b"old")?;
+        fs::write(second.join("library.h"), b"new")?;
+        let link = second.join("ptxas");
+        let relative = Path::new("../../opt/cuda/bin/ptxas");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(relative, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(relative, &link)?;
+        let cache = Cache::at(root.path().join("cache"));
+        let destination = root.path().join("prepared");
+        cache.refresh_sources_to(
+            &source,
+            &destination,
+            &[("deps/library".into(), first.clone())],
+        )?;
+        cache.refresh_sources_to(
+            &source,
+            &destination,
+            &[("deps/library".into(), second.clone())],
+        )?;
+        assert!(!is_link(&fs::symlink_metadata(
+            destination.join("deps/library")
+        )?));
+        assert_eq!(
+            fs::read(destination.join("deps/library/library.h"))?,
+            b"new"
+        );
+        assert_eq!(fs::read(first.join("library.h"))?, b"old");
+        assert_eq!(fs::read(second.join("library.h"))?, b"new");
+        let copied = destination.join("deps/library/ptxas");
+        assert_eq!(fs::read_link(&copied)?, fs::read_link(&link)?);
+        assert!(!copied.exists());
+        cache.refresh_sources_to(
+            &source,
+            &destination,
+            &[("deps/library".into(), second.clone())],
+        )?;
+        assert_eq!(fs::read_link(&copied)?, fs::read_link(&link)?);
+        cache.refresh_sources_to(&source, &destination, &[])?;
+        assert!(!destination.join("deps").exists());
+        assert!(first.join("library.h").is_file());
+        assert!(second.join("library.h").is_file());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "git", any(windows, unix)))]
+    fn refresh_rejects_escaping_overlapping_and_link_ancestor_mounts()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        let dep = root.path().join("dep");
+        fs::create_dir_all(&source)?;
+        fs::create_dir_all(&dep)?;
+        fs::write(dep.join("keep.h"), b"keep")?;
+        let cache = Cache::at(root.path().join("cache"));
+        let destination = root.path().join("prepared");
+        for mounts in [
+            vec![("../escape".into(), dep.clone())],
+            vec![
+                ("dep".into(), dep.clone()),
+                ("dep/child".into(), dep.clone()),
+            ],
+        ] {
+            assert!(
+                cache
+                    .refresh_sources_to(&source, &destination, &mounts)
+                    .is_err()
+            );
+        }
+        cache.refresh_sources_to(&source, &destination, &[("dep".into(), dep.clone())])?;
+        assert!(
+            cache
+                .refresh_sources_to(&source, &destination, &[("dep/child".into(), dep.clone())])
+                .is_err()
+        );
+        assert!(
+            cache
+                .refresh_sources_to(
+                    &source,
+                    &destination,
+                    &[("nested".into(), destination.clone())]
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(dep.join("keep.h"))?, b"keep");
+        Ok(())
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!(
             "woodshed-test-{tag}-{}-{:?}",
@@ -1496,6 +1895,56 @@ mod tests {
         let gz = lock_path(Path::new("/c/proj-9.4.1.tar.gz"), "download");
         let xz = lock_path(Path::new("/c/proj-9.4.1.tar.xz"), "download");
         assert_ne!(gz, xz);
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn archive_staging_is_disjoint_and_cleans_failed_attempts()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir()?;
+        let gz = root.path().join("same.tar.gz");
+        let xz = root.path().join("same.tar.xz");
+        let sha = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        Cache::stage_archive(&gz, &sha(b"gzip"), |first| {
+            fs::write(first, b"gzip").map_err(|error| Error::io("write first fixture", error))?;
+            Cache::stage_archive(&xz, &sha(b"xz"), |second| {
+                assert_ne!(first, second);
+                fs::write(second, b"xz").map_err(|error| Error::io("write second fixture", error))
+            })?;
+            Ok(())
+        })?;
+        assert_eq!(fs::read(&gz)?, b"gzip");
+        assert_eq!(fs::read(&xz)?, b"xz");
+
+        let failed = root.path().join("failed.tar.gz");
+        let result = Cache::stage_archive(&failed, &sha(b"verified"), |partial| {
+            fs::write(partial, b"wrong").map_err(|error| Error::io("write corrupt fixture", error))
+        });
+        assert!(matches!(result, Err(Error::Checksum { .. })));
+        let result = Cache::stage_archive(&failed, &sha(b"verified"), |partial| {
+            fs::write(partial, b"incomplete")
+                .map_err(|error| Error::io("write incomplete fixture", error))?;
+            Err(Error::Download {
+                url: "https://example.test/failed.tar.gz".into(),
+                detail: "fixture failure".into(),
+            })
+        });
+        assert!(
+            matches!(result, Err(Error::Download { detail, .. }) if detail == "fixture failure")
+        );
+        assert!(!failed.exists());
+
+        fs::create_dir(&failed)?;
+        let result = Cache::stage_archive(&failed, &sha(b"verified"), |partial| {
+            fs::write(partial, b"verified")
+                .map_err(|error| Error::io("write verified fixture", error))
+        });
+        assert!(matches!(result, Err(Error::Io { .. })));
+        assert!(failed.is_dir());
+        assert_eq!(fs::read_dir(root.path())?.count(), 3);
+        Ok(())
     }
 
     #[test]

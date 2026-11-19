@@ -444,20 +444,18 @@ fn source_tree_identity(root: &Path) -> Result<String> {
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(|error| Error::io("read local source entry", error))?;
         entries.sort_by_key(|entry| entry.file_name());
+        entries.retain(|entry| entry.file_name() != ".git");
+        hash.update((entries.len() as u64).to_le_bytes());
         for entry in entries {
-            if entry.file_name() == ".git" {
-                continue;
-            }
             let name = entry.file_name();
-            let bytes = name.as_encoded_bytes();
-            hash.update(bytes.len().to_le_bytes());
-            hash.update(bytes);
+            crate::cache::hash_field(hash, name.as_encoded_bytes());
             visit(&entry.path(), hash, ancestors)?;
         }
         ancestors.remove(&canonical);
         Ok(())
     }
     let mut hash = Sha256::new();
+    hash.update(b"woodshed-local-tree-framed\0");
     visit(root, &mut hash, &mut BTreeSet::new())?;
     Ok(format!("{:x}", hash.finalize()))
 }

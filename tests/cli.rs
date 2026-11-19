@@ -55,6 +55,95 @@ fn archive_server(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) 
 }
 
 #[test]
+fn setup_selects_running_release_and_preserves_compatible_requirements()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_woodshed"))
+            .current_dir(root)
+            .args(arguments)
+            .output()
+    };
+    fs::write(root.join("woodshed.toml"), "")?;
+    let lock = run(&["lock"])?;
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+
+    let cargo = root.join("Cargo.toml");
+    let package = "[package]\nname = 'setup-fixture'\nversion = '0.1.0'\n";
+    let release_line = concat!(
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        ".",
+        env!("CARGO_PKG_VERSION_MINOR")
+    );
+    let current = env!("CARGO_PKG_VERSION");
+    let caret = format!("^{current}");
+    let future = format!(
+        "{release_line}.{}",
+        env!("CARGO_PKG_VERSION_PATCH").parse::<u64>()? + 1
+    );
+    for requirement in [
+        None,
+        Some(release_line),
+        Some(caret.as_str()),
+        Some(future.as_str()),
+    ] {
+        let original = match requirement {
+            None => package.to_owned(),
+            Some(requirement) => {
+                format!("{package}\n[build-dependencies]\nwoodshed = '{requirement}'\n")
+            }
+        };
+        fs::write(&cargo, &original)?;
+        let output = run(&["setup", "--dry-run"])?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview = String::from_utf8(output.stdout)?;
+        let (manifest, bridge) = preview
+            .split_once("\n# build.rs\n")
+            .ok_or("setup did not preview both files")?;
+        let manifest: toml::Value = toml::from_str(manifest)?;
+        let woodshed = &manifest["build-dependencies"]["woodshed"];
+        assert_eq!(
+            woodshed["version"].as_str(),
+            Some(requirement.unwrap_or(release_line))
+        );
+        assert!(woodshed["features"].as_array().is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature.as_str() == Some("build"))
+        }));
+        assert!(bridge.contains("woodshed::build()"));
+        assert_eq!(fs::read_to_string(&cargo)?, original);
+        assert!(!root.join("build.rs").exists());
+    }
+
+    let malformed = format!("{release_line}.01");
+    for requirement in ["0.3", "0.40", malformed.as_str()] {
+        let original = format!("{package}\n[build-dependencies]\nwoodshed = '{requirement}'\n");
+        fs::write(&cargo, &original)?;
+        let output = run(&["setup", "--dry-run"])?;
+        assert!(!output.status.success(), "accepted {requirement}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("existing Woodshed version is preserved"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(release_line), "{stderr}");
+        assert_eq!(fs::read_to_string(&cargo)?, original);
+        assert!(!root.join("build.rs").exists());
+    }
+    Ok(())
+}
+
+#[test]
 fn cli_has_one_project_format_and_never_discovers_or_updates_combined_pins() {
     let directory = tempfile::tempdir().unwrap();
     let native = directory.path().join("native");

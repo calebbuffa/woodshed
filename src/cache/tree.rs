@@ -1,4 +1,4 @@
-use super::{Error, Path, PathBuf, Result, fs, is_link};
+use super::{Error, Path, PathBuf, Result, fs, hash_field, is_link};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -64,14 +64,15 @@ fn fingerprint(root: &Path, allow_absolute: bool) -> Result<String> {
                 });
             }
             hash.update(b"link\0");
-            let bytes = link.as_os_str().as_encoded_bytes();
-            hash.update(bytes.len().to_le_bytes());
-            hash.update(bytes);
+            hash_field(hash, link.as_os_str().as_encoded_bytes());
             if resolved.is_none() {
+                hash.update(b"dangling\0");
                 return Ok(());
             }
+            hash.update(b"resolved\0");
             fs::metadata(path).map_err(|error| Error::io("inspect cached link target", error))?
         } else {
+            hash.update(b"entry\0");
             metadata
         };
         #[cfg(unix)]
@@ -108,11 +109,10 @@ fn fingerprint(root: &Path, allow_absolute: bool) -> Result<String> {
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(|error| Error::io("read cached source entry", error))?;
         entries.sort_by_key(|entry| entry.file_name());
+        hash.update((entries.len() as u64).to_le_bytes());
         for entry in entries {
             let name = entry.file_name();
-            let bytes = name.as_encoded_bytes();
-            hash.update(bytes.len().to_le_bytes());
-            hash.update(bytes);
+            hash_field(hash, name.as_encoded_bytes());
             visit(&entry.path(), root, hash, ancestors, allow_absolute)?;
         }
         ancestors.remove(&canonical);
@@ -133,6 +133,8 @@ fn fingerprint(root: &Path, allow_absolute: bool) -> Result<String> {
         .canonicalize()
         .map_err(|error| Error::io("resolve managed source root", error))?;
     let mut hash = Sha256::new();
+    hash.update(b"woodshed-managed-tree-framed\0");
+    hash.update([u8::from(allow_absolute)]);
     visit(
         &canonical,
         &canonical,

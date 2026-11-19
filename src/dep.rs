@@ -133,15 +133,15 @@ impl Dep {
 
     /// Directory name for this dependency's extracted source.
     pub(crate) fn source_dir_name(&self) -> String {
+        // Include the inventory format in the entry key, so older tools can
+        // keep using their existing source trees without either tool replacing them.
+        let key = crate::BuildKey::explicit(crate::cache::SOURCE_INVENTORY);
         if let Some(git) = &self.git {
-            use sha2::{Digest, Sha256};
-            let mut identity = Sha256::new();
-            identity.update(git.repository.as_bytes());
-            identity.update([0]);
-            identity.update(git.revision.as_bytes());
-            return format!("{}-git-{:x}", self.name, identity.finalize());
+            let identity = key.mix("git").mix(&git.repository).mix(&git.revision);
+            return format!("git-{}", identity.fingerprint());
         }
-        format!("archive-{}", self.sha256.to_ascii_lowercase())
+        let identity = key.mix("archive").mix(self.sha256.to_ascii_lowercase());
+        format!("archive-tree-{}", identity.fingerprint())
     }
 }
 
@@ -440,7 +440,6 @@ mod tests {
     #[test]
     fn archive_source_identity_uses_content_not_release_labels() {
         let original = dep();
-        assert_eq!(original.source_dir_name(), "archive-ab");
         let mut changed = original.clone();
         changed.version = "different".into();
         changed.name = "alias".into();

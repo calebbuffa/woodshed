@@ -185,11 +185,16 @@ fn setup_is_previewable_idempotent_stale_guarded_and_preserves_existing_scripts(
     )
     .unwrap();
     assert!(woodshed::setup::plan(&cargo, None).is_err());
+    let release_line = concat!(
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        ".",
+        env!("CARGO_PKG_VERSION_MINOR")
+    );
     for dependency in [
-        "woodshed = '0.2'",
-        "woodshed = { version = '0.3', optional = true }",
-        "woodshed = { package = 'something-else', version = '0.3' }",
-        "woodshed = { git = 'https://example.test/woodshed' }",
+        "woodshed = '0.2'".into(),
+        format!("woodshed = {{ version = '{release_line}', optional = true }}"),
+        format!("woodshed = {{ package = 'something-else', version = '{release_line}' }}"),
+        "woodshed = { git = 'https://example.test/woodshed' }".into(),
     ] {
         fs::write(
             &cargo,
@@ -199,7 +204,7 @@ fn setup_is_previewable_idempotent_stale_guarded_and_preserves_existing_scripts(
         assert!(woodshed::setup::plan(&cargo, None).is_err(), "{dependency}");
         assert!(!root.join("build.rs").exists());
     }
-    fs::write(&cargo, format!("{original}\n[build-dependencies]\nwoodshed = {{ version = '0.3', features = ['cmake'], default-features = false }}\n")).unwrap();
+    fs::write(&cargo, format!("{original}\n[build-dependencies]\nwoodshed = {{ version = '{release_line}', features = ['cmake'], default-features = false }}\n")).unwrap();
     let plan = woodshed::setup::plan(&cargo, None).unwrap();
     assert!(plan.cargo_toml().contains("default-features = false"));
     assert!(plan.cargo_toml().contains("\"cmake\""));

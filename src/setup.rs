@@ -10,6 +10,27 @@ use std::{
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 const BRIDGE: &str = "fn main() -> woodshed::Result<()> {\n    woodshed::build()\n}\n";
+const RELEASE_LINE: &str = concat!(
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_MINOR")
+);
+
+fn compatible_requirement(requirement: &str) -> bool {
+    let requirement = requirement.strip_prefix('^').unwrap_or(requirement);
+    if requirement == RELEASE_LINE {
+        return true;
+    }
+    let Some(patch) = requirement
+        .strip_prefix(RELEASE_LINE)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+    else {
+        return false;
+    };
+    (patch == "0" || !patch.starts_with('0'))
+        && patch.bytes().all(|byte| byte.is_ascii_digit())
+        && patch.parse::<u64>().is_ok()
+}
 
 /// A previewable, stale-guarded Cargo integration.
 pub struct Setup {
@@ -97,6 +118,10 @@ impl Setup {
 /// `woodshed_path` selects an existing local Woodshed checkout instead of the
 /// registry. Existing scripts, disabled/custom build paths, workspace-inherited
 /// dependencies, and conflicting dependency sources require manual integration.
+/// A new registry dependency uses the documented release line, so an
+/// unpublished local patch does not raise the registry minimum.
+/// Existing simple caret requirements for that release line are unchanged.
+/// Cargo resolves registry availability; setup does not constrain the patch.
 pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
     let cargo =
         std::path::absolute(cargo).map_err(|error| Error::io("resolve Cargo manifest", error))?;
@@ -202,7 +227,7 @@ pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
         .ok_or_else(|| invalid("build-dependencies must be a table"))?;
     if dependencies.get("woodshed").is_none() {
         dependencies["woodshed"] = Item::Table(Table::new());
-        dependencies["woodshed"]["version"] = value("0.3");
+        dependencies["woodshed"]["version"] = value(RELEASE_LINE);
     }
     let dep = &mut dependencies["woodshed"];
     if let Some(version) = dep.as_str().map(str::to_owned) {
@@ -231,14 +256,11 @@ pub fn plan(cargo: &Path, woodshed_path: Option<&Path>) -> Result<Setup> {
     }
     if dep
         .get("version")
-        .and_then(Item::as_str)
-        .is_some_and(|version| {
-            !["0.3", "^0.3", "0.3.0", "^0.3.0", "0.3.1", "^0.3.1"].contains(&version)
-        })
+        .is_some_and(|version| !version.as_str().is_some_and(compatible_requirement))
     {
-        return Err(invalid(
-            "existing Woodshed version is preserved; upgrade to 0.3 explicitly before setup",
-        ));
+        return Err(invalid(format!(
+            "existing Woodshed version is preserved; select a simple caret requirement in release line {RELEASE_LINE} before setup"
+        )));
     }
     if let Some(path) = woodshed_path {
         let path = std::path::absolute(path)

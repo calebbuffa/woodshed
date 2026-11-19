@@ -1,7 +1,7 @@
 [package]
 name = "woodshed"
 description = "Build-script toolkit for vendoring, caching, and building native C/C++ dependencies from source"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ default = ["manifest", "download", "tar-gz"]
 # Read project declarations and immutable locks.
 manifest = ["dep:toml", "dep:serde", "dep:cargo-platform"]
 # Fetch archives over HTTPS.
-download = ["dep:ureq"]
+download = ["dep:ureq", "dep:tempfile"]
 # Archive formats. Enable only the ones your dependencies actually ship.
 tar-gz = ["dep:tar", "dep:flate2"]
 tar-bz2 = ["dep:tar", "dep:bzip2"]
